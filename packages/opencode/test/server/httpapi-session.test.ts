@@ -34,7 +34,7 @@ import * as DateTime from "effect/DateTime"
 import { eq } from "drizzle-orm"
 import { resetDatabase } from "../fixture/db"
 import { disposeAllInstances, provideInstanceEffect, TestInstance, tmpdirScoped } from "../fixture/fixture"
-import { TestLLMServer } from "../lib/llm-server"
+import { reply, TestLLMServer } from "../lib/llm-server"
 import { testProviderConfig } from "../lib/test-provider"
 import { pollWithTimeout, testEffect } from "../lib/effect"
 
@@ -294,6 +294,14 @@ describe("session HttpApi", () => {
         expect(prompt.status).toBe(404)
         expect(yield* responseJson(prompt)).toEqual(missingSessionBody)
 
+        const withdraw = yield* request(pathFor(SessionPaths.withdraw, { sessionID: missingSession }), {
+          headers: { ...headers, "content-type": "application/json" },
+          method: "POST",
+          body: JSON.stringify({ requestID: "missing" }),
+        })
+        expect(withdraw.status).toBe(404)
+        expect(yield* responseJson(withdraw)).toEqual(missingSessionBody)
+
         const abort = yield* request(pathFor(SessionPaths.abort, { sessionID: missingSession }), {
           headers,
           method: "POST",
@@ -312,6 +320,28 @@ describe("session HttpApi", () => {
           name: "NotFoundError",
           data: { message: `Message not found: ${missingMessage}` },
         })
+      }),
+    { git: true, config: { formatter: false, lsp: false } },
+  )
+
+  it.instance(
+    "withdrawal leaves existing transcript history alone and requires a receipt ID",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const headers = { "x-opencode-directory": test.directory, "content-type": "application/json" }
+        const session = yield* createSession({ title: "Existing history" })
+        const consumed = yield* createTextMessage(session.id, "already consumed")
+        const url = pathFor(SessionPaths.withdraw, { sessionID: session.id })
+        expect((yield* request(url, { headers, method: "POST", body: "{}" })).status).toBe(400)
+        expect(
+          yield* requestJson(url, { headers, method: "POST", body: JSON.stringify({ requestID: "empty" }) }),
+        ).toEqual([])
+        const messages = yield* requestJson<SessionV1.WithParts[]>(
+          pathFor(SessionPaths.messages, { sessionID: session.id }),
+          { headers },
+        )
+        expect(messages.map((message) => message.info.id)).toEqual([consumed.info.id])
       }),
     { git: true, config: { formatter: false, lsp: false } },
   )
@@ -424,6 +454,70 @@ describe("session HttpApi", () => {
         cwd: sessionDirectory,
         root: sessionDirectory,
       })
+    }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
+  )
+
+  it.live("prompt_async admits before withdrawal and concurrent clients can retry receipts", () =>
+    Effect.gen(function* () {
+      const llm = yield* TestLLMServer
+      const release = Promise.withResolvers<void>()
+      yield* Effect.addFinalizer(() => Effect.sync(() => release.resolve()))
+      yield* llm.push(reply().wait(release.promise).text("active result").stop())
+      const directory = yield* tmpdirScoped({ git: true, config: testProviderConfig(llm.url) })
+      const session = yield* createSession({ title: "Pinned" }).pipe(provideInstanceEffect(directory))
+      const headers = { "content-type": "application/json", "x-opencode-directory": directory }
+      const active = yield* request(pathFor(SessionPaths.promptAsync, { sessionID: session.id }), {
+        headers,
+        method: "POST",
+        body: JSON.stringify({
+          model: { providerID: "test", modelID: "test-model" },
+          parts: [{ type: "text", text: "active work" }],
+        }),
+      })
+      expect(active.status).toBe(204)
+      yield* llm.wait(1)
+      const input = {
+        messageID: MessageID.ascending(),
+        model: { providerID: ProviderV2.ID.make("test"), modelID: ModelV2.ID.make("test-model") },
+        parts: [{ type: "text" as const, text: "immediately withdrawn" }],
+      }
+      const queued = yield* request(pathFor(SessionPaths.promptAsync, { sessionID: session.id }), {
+        headers,
+        method: "POST",
+        body: JSON.stringify(input),
+      })
+      expect(queued.status).toBe(204)
+      const duplicate = yield* request(pathFor(SessionPaths.promptAsync, { sessionID: session.id }), {
+        headers,
+        method: "POST",
+        body: JSON.stringify(input),
+      })
+      expect(duplicate.status).toBe(400)
+      const withdraw = (requestID: string) =>
+        requestJson<unknown[]>(pathFor(SessionPaths.withdraw, { sessionID: session.id }), {
+          headers,
+          method: "POST",
+          body: JSON.stringify({ requestID }),
+        })
+      const results = yield* Effect.all([withdraw("one"), withdraw("two")], { concurrency: "unbounded" })
+      expect(results.flat()).toEqual([{ ...input, sessionID: session.id }])
+      expect(results.filter((result) => result.length === 0)).toHaveLength(1)
+      expect(yield* withdraw("one")).toEqual(results[0])
+      expect(yield* withdraw("two")).toEqual(results[1])
+      release.resolve()
+      yield* pollWithTimeout(
+        Session.use.messages({ sessionID: session.id }).pipe(
+          provideInstanceEffect(directory),
+          Effect.orDie,
+          Effect.map((messages) =>
+            messages.some((message) => message.info.role === "assistant" && message.info.time.completed)
+              ? true
+              : undefined,
+          ),
+        ),
+        "active response did not finish",
+      )
+      expect(yield* llm.calls).toBe(1)
     }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
   )
 

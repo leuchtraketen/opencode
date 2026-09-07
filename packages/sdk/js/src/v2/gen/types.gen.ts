@@ -3857,6 +3857,24 @@ export type PtyTicketConnectToken = {
   expires_in: number
 }
 
+export type SessionPromptPromptInput = {
+  sessionID: string
+  messageID?: string
+  model?: {
+    providerID: string
+    modelID: string
+  }
+  agent?: string
+  noReply?: boolean
+  tools?: {
+    [key: string]: boolean
+  }
+  format?: OutputFormat
+  system?: string
+  variant?: string
+  parts: Array<TextPartInput | FilePartInput | AgentPartInput | SubtaskPartInput>
+}
+
 export type WorkspaceEventConnectionStatus = {
   workspaceID: string
   status: "connected" | "connecting" | "disconnected" | "error"
@@ -10140,6 +10158,42 @@ export type SessionSummarizeResponses = {
 }
 
 export type SessionSummarizeResponse = SessionSummarizeResponses[keyof SessionSummarizeResponses]
+
+export type SessionWithdrawData = {
+  body?: {
+    requestID: string
+  }
+  path: {
+    sessionID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/session/{sessionID}/queue/withdraw"
+}
+
+export type SessionWithdrawErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+}
+
+export type SessionWithdrawError = SessionWithdrawErrors[keyof SessionWithdrawErrors]
+
+export type SessionWithdrawResponses = {
+  /**
+   * Original unconsumed prompts in admission order
+   */
+  200: Array<SessionPromptPromptInput>
+}
+
+export type SessionWithdrawResponse = SessionWithdrawResponses[keyof SessionWithdrawResponses]
 
 export type SessionPromptAsyncData = {
   body?: {

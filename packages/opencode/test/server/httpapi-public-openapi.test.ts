@@ -70,6 +70,26 @@ function isBuiltInEndpointError(name: string) {
 }
 
 describe("PublicApi OpenAPI v2 errors", () => {
+  test("documents legacy queue withdrawal with original prompt payloads", () => {
+    const spec = OpenApi.fromApi(PublicApi) as OpenApiSpec
+    expect(spec.paths["/session/{sessionID}/queue/withdraw"]?.post).toMatchObject({
+      operationId: "session.withdraw",
+      responses: {
+        "200": {
+          content: {
+            "application/json": {
+              schema: { type: "array", items: { $ref: "#/components/schemas/SessionPromptPromptInput" } },
+            },
+          },
+        },
+      },
+    })
+    expect(spec.components.schemas.SessionPromptPromptInput?.required).toEqual(["sessionID", "parts"])
+    expect(spec.paths["/session/{sessionID}/queue/withdraw"]?.post?.requestBody).toMatchObject({
+      content: { "application/json": { schema: { required: ["requestID"] } } },
+    })
+  })
+
   test("includes plugin-facing core schemas", () => {
     const spec = OpenApi.fromApi(PublicApi) as OpenApiSpec
 

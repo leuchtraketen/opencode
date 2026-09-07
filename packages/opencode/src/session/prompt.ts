@@ -42,7 +42,7 @@ import { Truncate } from "@/tool/truncate"
 import { Image } from "@/image/image"
 import { decodeDataUrl } from "@/util/data-url"
 import { Process } from "@/util/process"
-import { Cause, Effect, Exit, Latch, Layer, Option, Scope, Context, Schema, Types } from "effect"
+import { Cause, Deferred, Effect, Exit, Latch, Layer, Option, Scope, Context, Schema, Types } from "effect"
 import { InstanceState } from "@/effect/instance-state"
 import { TaskTool, type TaskPromptOps } from "@/tool/task"
 import { SessionRunState } from "./run-state"
@@ -51,8 +51,8 @@ import { EventV2Bridge } from "@/event-v2-bridge"
 import { Database } from "@opencode-ai/core/database/database"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderV2 } from "@opencode-ai/core/provider"
-import { eq } from "drizzle-orm"
-import { SessionTable } from "@opencode-ai/core/session/sql"
+import { and, eq } from "drizzle-orm"
+import { MessageTable, SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionReminders } from "./reminders"
 import { SessionTools } from "./tools"
 import { LLMEvent } from "@opencode-ai/llm"
@@ -101,14 +101,42 @@ function isOrphanedInterruptedTool(part: SessionV1.ToolPart) {
 
 export interface Interface {
   readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
-  readonly prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
+  readonly prompt: (
+    input: PromptInput,
+    options?: {
+      admitted?: Deferred.Deferred<void, Image.Error | PromptConflictError | PromptAbandonedError>
+      task?: boolean
+    },
+  ) => Effect.Effect<SessionV1.WithParts, Image.Error | PromptConflictError | PromptAbandonedError>
+  readonly withdraw: (sessionID: SessionID, requestID: string) => Effect.Effect<PromptInput[]>
   readonly loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts>
   readonly shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError>
-  readonly command: (input: CommandInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
+  readonly command: (
+    input: CommandInput,
+  ) => Effect.Effect<SessionV1.WithParts, Image.Error | PromptConflictError | PromptAbandonedError>
   readonly resolvePromptParts: (template: string) => Effect.Effect<PromptInput["parts"]>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SessionPrompt") {}
+
+type PendingPrompt = {
+  id: MessageID
+  input: PromptInput
+  message?: SessionV1.WithParts
+  ready: Latch.Latch
+  generation: number
+  state: "preparing" | "publishing" | "ready" | "claimed" | "withdrawn" | "failed"
+}
+
+type PromptQueue = {
+  pending: PendingPrompt[]
+  receipts: Map<string, { inputs: PromptInput[]; ids: MessageID[] }>
+  order: Map<MessageID, { after?: MessageID; parts: Map<PartID, number> }>
+  hidden: Set<MessageID>
+  reading?: Set<MessageID>
+  generation: number
+  closed: boolean
+}
 
 const layer = Layer.effect(
   Service,
@@ -141,16 +169,106 @@ const layer = Layer.effect(
     const flags = yield* RuntimeFlags.Service
     const database = yield* Database.Service
     const { db } = database
+
+    const queues = yield* InstanceState.make(() =>
+      Effect.gen(function* () {
+        const data = {
+          sessions: new Map<SessionID, PromptQueue>(),
+          used: new Map<MessageID, { sessionID: SessionID; publishing: boolean }>(),
+        }
+        const close = Effect.fnUntraced(function* (sessionID: SessionID, remove: boolean) {
+          const queue = data.sessions.get(sessionID)
+          if (!queue) return
+          queue.closed = true
+          queue.generation++
+          const pending = queue.pending.splice(0)
+          const hidden = [...queue.hidden]
+          for (const entry of pending) entry.state = "withdrawn"
+          data.sessions.delete(sessionID)
+          for (const [id, owner] of data.used)
+            if (owner.sessionID === sessionID && !owner.publishing) data.used.delete(id)
+          queue.receipts.clear()
+          queue.order.clear()
+          queue.hidden.clear()
+          for (const entry of pending) yield* entry.ready.open
+          if (remove)
+            for (const messageID of hidden)
+              yield* sessions.removeMessage({ sessionID, messageID }).pipe(Effect.ignoreCause)
+        })
+        const off = yield* events.listen((event) =>
+          event.type === SessionV1.Event.Deleted.type
+            ? close((event.data as typeof SessionV1.Event.Deleted.data.Type).sessionID, false)
+            : Effect.void,
+        )
+        yield* Effect.addFinalizer(() =>
+          off.pipe(
+            Effect.andThen(Effect.forEach([...data.sessions.keys()], (id) => close(id, true), { discard: true })),
+          ),
+        )
+        return data
+      }),
+    )
+
+    const queueFor = Effect.fnUntraced(function* (sessionID: SessionID) {
+      const data = yield* InstanceState.get(queues)
+      const existing = data.sessions.get(sessionID)
+      if (existing) return existing
+      const queue: PromptQueue = {
+        pending: [],
+        receipts: new Map(),
+        order: new Map(),
+        hidden: new Set(),
+        generation: 0,
+        closed: false,
+      }
+      data.sessions.set(sessionID, queue)
+      return queue
+    })
+
+    const withdraw = Effect.fn("SessionPrompt.withdraw")(function* (sessionID: SessionID, requestID: string) {
+      const queue = yield* queueFor(sessionID)
+      return yield* Effect.uninterruptible(
+        Effect.gen(function* () {
+          // No yields between selecting the batch, marking it withdrawn, and
+          // recording the receipt. Claim and admission use the same JS state.
+          const pending = queue.receipts.has(requestID) ? [] : queue.pending.splice(0)
+          for (const entry of pending) entry.state = "withdrawn"
+          const receipt = queue.receipts.get(requestID) ?? {
+            inputs: pending.map((entry) => entry.input),
+            ids: pending.map((entry) => entry.id),
+          }
+          queue.receipts.set(requestID, receipt)
+          for (const entry of pending) yield* entry.ready.open
+          // Never wait for a publisher here: a message listener may be making
+          // this request reentrantly. Its publisher also cleans up on exit.
+          for (const messageID of receipt.ids) {
+            const message = yield* db
+              .select({ id: MessageTable.id })
+              .from(MessageTable)
+              .where(and(eq(MessageTable.id, messageID), eq(MessageTable.session_id, sessionID)))
+              .get()
+              .pipe(Effect.orDie)
+            if (message) yield* sessions.removeMessage({ sessionID, messageID })
+          }
+          return structuredClone(receipt.inputs)
+        }),
+      )
+    })
+
     const ops = Effect.fn("SessionPrompt.ops")(function* () {
       return {
         cancel: (sessionID: SessionID) => cancel(sessionID),
         resolvePromptParts: (template: string) => resolvePromptParts(template),
-        prompt: (input: PromptInput) => prompt(input).pipe(Effect.catch(Effect.die)),
+        prompt: (input: PromptInput) => prompt(input, { task: true }).pipe(Effect.catch(Effect.die)),
       } satisfies TaskPromptOps
     })
 
     const cancel = Effect.fn("SessionPrompt.cancel")(function* (sessionID: SessionID) {
       yield* Effect.logInfo("cancel", { "session.id": sessionID })
+      const queue = yield* queueFor(sessionID)
+      // Do not let preparation admitted before cancellation start a new runner.
+      queue.generation++
+      for (const entry of [...queue.pending]) yield* entry.ready.open
       yield* state.cancel(sessionID)
     })
 
@@ -159,7 +277,7 @@ const layer = Layer.effect(
       const parts: Types.DeepMutable<PromptInput["parts"]> = [{ type: "text", text: template }]
       const files = ConfigMarkdown.files(template)
       const seen = new Set<string>()
-      yield* Effect.forEach(
+      const attachments = yield* Effect.forEach(
         files,
         Effect.fnUntraced(function* (match) {
           const name = match[1]
@@ -174,19 +292,19 @@ const layer = Layer.effect(
           const info = yield* fsys.stat(filepath).pipe(Effect.option)
           if (Option.isNone(info)) {
             const found = yield* agents.get(name)
-            if (found) parts.push({ type: "agent", name: found.name })
-            return
+            return found ? { type: "agent" as const, name: found.name } : undefined
           }
           const stat = info.value
-          parts.push({
-            type: "file",
+          return {
+            type: "file" as const,
             url: pathToFileURL(filepath).href,
             filename: name,
             mime: stat.type === "Directory" ? "application/x-directory" : "text/plain",
-          })
+          }
         }),
-        { concurrency: "unbounded", discard: true },
+        { concurrency: "unbounded" },
       )
+      parts.push(...attachments.filter((part) => part !== undefined))
       return parts
     })
 
@@ -632,14 +750,18 @@ const layer = Layer.effect(
       return yield* provider.defaultModel().pipe(Effect.orDie)
     })
 
-    const createUserMessage = Effect.fn("SessionPrompt.createUserMessage")(function* (input: PromptInput) {
+    const createUserMessage = Effect.fn("SessionPrompt.createUserMessage")(function* (
+      input: PromptInput,
+      abandoned: () => boolean,
+    ) {
       const agentName = input.agent
       const ag = agentName ? yield* agents.get(agentName) : yield* agents.defaultInfo()
       if (!ag) {
         const available = (yield* agents.list()).filter((a) => !a.hidden).map((a) => a.name)
         const hint = available.length ? ` Available agents: ${available.join(", ")}` : ""
         const error = new NamedError.Unknown({ message: `Agent not found: "${agentName}".${hint}` })
-        yield* events.publish(Session.Event.Error, { sessionID: input.sessionID, error: error.toObject() })
+        if (!abandoned())
+          yield* events.publish(Session.Event.Error, { sessionID: input.sessionID, error: error.toObject() })
         throw error
       }
 
@@ -669,26 +791,8 @@ const layer = Layer.effect(
         format: input.format,
       }
 
-      const current = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
-      if (
-        current.agent !== info.agent ||
-        current.model?.providerID !== info.model.providerID ||
-        current.model?.id !== info.model.modelID ||
-        (current.model?.variant === "default" ? undefined : current.model?.variant) !== info.model.variant
-      ) {
-        yield* sessions.setAgentModel({
-          sessionID: input.sessionID,
-          agent: info.agent,
-          model: {
-            id: info.model.modelID,
-            providerID: info.model.providerID,
-            variant: info.model.variant ?? "default",
-          },
-          time: info.time.created,
-        })
-      }
-
       yield* Effect.addFinalizer(() => instruction.clear(info.id))
+      if (abandoned()) return { info, parts: [] }
 
       type Draft<T> = T extends SessionV1.Part ? Omit<T, "id"> & { id?: string } : never
       const assign = (part: Draft<SessionV1.Part>): SessionV1.Part => ({
@@ -891,10 +995,11 @@ const layer = Layer.effect(
                   const error = Cause.squash(exit.cause)
                   yield* Effect.logError("failed to read file", { error, filepath })
                   const message = error instanceof Error ? error.message : String(error)
-                  yield* events.publish(Session.Event.Error, {
-                    sessionID: input.sessionID,
-                    error: new NamedError.Unknown({ message }).toObject(),
-                  })
+                  if (!abandoned())
+                    yield* events.publish(Session.Event.Error, {
+                      sessionID: input.sessionID,
+                      error: new NamedError.Unknown({ message }).toObject(),
+                    })
                   pieces.push({
                     messageID: info.id,
                     sessionID: input.sessionID,
@@ -913,10 +1018,11 @@ const layer = Layer.effect(
                   const error = Cause.squash(exit.cause)
                   yield* Effect.logError("failed to read directory", { error, filepath })
                   const message = error instanceof Error ? error.message : String(error)
-                  yield* events.publish(Session.Event.Error, {
-                    sessionID: input.sessionID,
-                    error: new NamedError.Unknown({ message }).toObject(),
-                  })
+                  if (!abandoned())
+                    yield* events.publish(Session.Event.Error, {
+                      sessionID: input.sessionID,
+                      error: new NamedError.Unknown({ message }).toObject(),
+                    })
                   return [
                     {
                       messageID: info.id,
@@ -995,6 +1101,7 @@ const layer = Layer.effect(
       const resolvedParts = yield* Effect.forEach(input.parts, resolvePart, { concurrency: "unbounded" }).pipe(
         Effect.map((x) => x.flat().map(assign)),
       )
+      if (abandoned()) return { info, parts: resolvedParts }
 
       yield* plugin.trigger(
         "chat.message",
@@ -1043,58 +1150,334 @@ const layer = Layer.effect(
         })
       }
 
-      yield* sessions.updateMessage(info)
-      for (const part of parts) yield* sessions.updatePart(part)
-
       return { info, parts }
     }, Effect.scoped)
 
-    const prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error> = Effect.fn(
-      "SessionPrompt.prompt",
-    )(function* (input: PromptInput) {
-      const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
-      yield* revert.cleanup(session)
-      const message = yield* createUserMessage(input)
-      yield* sessions.touch(input.sessionID)
-
-      const permissions: PermissionV1.Rule[] = []
-      for (const [t, enabled] of Object.entries(input.tools ?? {})) {
-        permissions.push({ permission: t, action: enabled ? "allow" : "deny", pattern: "*" })
+    const selectAgentModel = Effect.fnUntraced(function* (info: SessionV1.User, current: Session.Info) {
+      if (
+        current.agent !== info.agent ||
+        current.model?.providerID !== info.model.providerID ||
+        current.model?.id !== info.model.modelID ||
+        (current.model?.variant === "default" ? undefined : current.model?.variant) !== info.model.variant
+      ) {
+        yield* sessions.setAgentModel({
+          sessionID: info.sessionID,
+          agent: info.agent,
+          model: {
+            id: info.model.modelID,
+            providerID: info.model.providerID,
+            variant: info.model.variant ?? "default",
+          },
+          time: Date.now(),
+        })
       }
-      if (permissions.length > 0) {
-        session.permission = permissions
-        yield* sessions.setPermission({ sessionID: session.id, permission: permissions })
-      }
-
-      if (input.noReply === true) return message
-      return yield* loop({ sessionID: input.sessionID })
     })
 
-    const lastAssistant = Effect.fnUntraced(function* (sessionID: SessionID) {
+    const publishUserMessage = Effect.fnUntraced(function* (
+      message: SessionV1.WithParts,
+      tools: PromptInput["tools"],
+      abandoned: () => boolean,
+      select: boolean,
+    ) {
+      const info = message.info
+      if (info.role !== "user") throw new Error("Expected a user prompt")
+      if (abandoned()) return
+      const current = yield* sessions
+        .get(info.sessionID)
+        .pipe(Effect.mapError(() => new PromptAbandonedError({ messageID: info.id })))
+      if (abandoned()) return
+      yield* revert.cleanup(current)
+      if (abandoned()) return
+      if (select) yield* selectAgentModel(info, current)
+      if (abandoned()) return
+      yield* Effect.gen(function* () {
+        yield* sessions.updateMessage(info)
+        if (abandoned()) return
+        for (const part of message.parts) {
+          yield* sessions.updatePart(part)
+          if (abandoned()) return
+        }
+        yield* sessions.touch(info.sessionID)
+        if (abandoned()) return
+        const permissions: PermissionV1.Rule[] = Object.entries(tools ?? {}).map(([permission, enabled]) => ({
+          permission,
+          action: enabled ? "allow" : "deny",
+          pattern: "*",
+        }))
+        if (permissions.length) yield* sessions.setPermission({ sessionID: info.sessionID, permission: permissions })
+      }).pipe(
+        Effect.onExit((exit) =>
+          Exit.isSuccess(exit) && !abandoned()
+            ? Effect.void
+            : sessions.removeMessage({ sessionID: info.sessionID, messageID: info.id }).pipe(
+                Effect.catchCause((cause) =>
+                  Effect.logError("failed to clean up prompt publication", {
+                    sessionID: info.sessionID,
+                    messageID: info.id,
+                    cause,
+                  }).pipe(Effect.andThen(Effect.failCause(cause))),
+                ),
+                Effect.asVoid,
+              ),
+        ),
+      )
+    }, Effect.uninterruptible)
+
+    const prompt: Interface["prompt"] = Effect.fn("SessionPrompt.prompt")(
+      function* (input: PromptInput, options?: Parameters<Interface["prompt"]>[1]) {
+        input = structuredClone(input)
+        const messageID = input.messageID ?? MessageID.ascending()
+        const queue = yield* queueFor(input.sessionID)
+        yield* sessions.get(input.sessionID).pipe(Effect.mapError(() => new PromptAbandonedError({ messageID })))
+        const data = yield* InstanceState.get(queues)
+        const reservation = { sessionID: input.sessionID, publishing: false }
+        // Internal task prompts, noReply writes, and wholly synthetic inputs are
+        // not editable user admissions. They retain their immediate-write path.
+        const entry: PendingPrompt | undefined =
+          !options?.task &&
+          !input.noReply &&
+          !input.parts.some((part) => part.type === "subtask") &&
+          input.parts.some((part) => part.type !== "text" || (!part.synthetic && !part.ignored))
+            ? { id: messageID, input, ready: Latch.makeUnsafe(), state: "preparing", generation: queue.generation }
+            : undefined
+        const { message, generation } = yield* Effect.uninterruptibleMask((restore) =>
+          Effect.gen(function* () {
+            if (queue.closed) return yield* new PromptAbandonedError({ messageID })
+            if (data.used.has(messageID)) return yield* new PromptConflictError({ messageID })
+            data.used.set(messageID, reservation)
+            const existing = yield* db
+              .select({ id: MessageTable.id })
+              .from(MessageTable)
+              .where(eq(MessageTable.id, messageID))
+              .get()
+              .pipe(
+                Effect.orDie,
+                Effect.onExit((exit) =>
+                  Exit.isFailure(exit)
+                    ? Effect.sync(() => {
+                        if (data.used.get(messageID) === reservation) data.used.delete(messageID)
+                      })
+                    : Effect.void,
+                ),
+              )
+            if (existing || queue.closed) {
+              if (data.used.get(messageID) === reservation) data.used.delete(messageID)
+              if (queue.closed) return yield* new PromptAbandonedError({ messageID })
+              return yield* new PromptConflictError({ messageID })
+            }
+            const generation = queue.generation
+            // Non-editable inputs also remain invisible to model snapshots until
+            // their publication completes; they never enter the withdrawal batch.
+            queue.hidden.add(messageID)
+            queue.reading?.add(messageID)
+            if (entry) {
+              entry.generation = generation
+              queue.pending.push(entry)
+            }
+            const abandoned = () =>
+              queue.closed || (!!entry && (entry.state === "withdrawn" || generation !== queue.generation))
+            const message = yield* Effect.gen(function* () {
+              if (options?.admitted) yield* Deferred.succeed(options.admitted, undefined)
+              const message = yield* restore(createUserMessage({ ...structuredClone(input), messageID }, abandoned))
+              message.info.id = messageID
+              message.info.sessionID = input.sessionID
+              for (const part of message.parts) {
+                part.messageID = messageID
+                part.sessionID = input.sessionID
+              }
+              if (entry && !abandoned()) {
+                entry.message = message
+                entry.state = "publishing"
+              }
+              reservation.publishing = true
+              yield* publishUserMessage(message, entry ? undefined : input.tools, abandoned, !entry).pipe(
+                Effect.ensuring(
+                  Effect.sync(() => {
+                    reservation.publishing = false
+                    // Deletion cannot release an ID while its old publisher can
+                    // still write. Release it once that publisher has settled.
+                    if (queue.closed && data.used.get(messageID) === reservation) data.used.delete(messageID)
+                  }),
+                ),
+              )
+              if (entry && !abandoned()) {
+                entry.state = "ready"
+                yield* entry.ready.open
+              }
+              if (!entry) {
+                queue.hidden.delete(messageID)
+                if (data.used.get(messageID) === reservation) data.used.delete(messageID)
+              }
+              return message
+            }).pipe(
+              Effect.onExit((exit) =>
+                Effect.gen(function* () {
+                  if (Exit.isSuccess(exit)) return
+                  if (entry) {
+                    if (!abandoned()) {
+                      entry.state = "failed"
+                      queue.pending = queue.pending.filter((item) => item !== entry)
+                    }
+                    yield* entry.ready.open
+                  }
+                  if (!abandoned()) {
+                    const stored = yield* db
+                      .select({ id: MessageTable.id })
+                      .from(MessageTable)
+                      .where(eq(MessageTable.id, messageID))
+                      .get()
+                      .pipe(Effect.orDie)
+                    if (!stored) {
+                      if (data.used.get(messageID) === reservation) data.used.delete(messageID)
+                      queue.hidden.delete(messageID)
+                    }
+                  }
+                }),
+              ),
+              Effect.catchCause(
+                (cause): Effect.Effect<never, Image.Error | PromptAbandonedError> =>
+                  abandoned() ? Effect.fail(new PromptAbandonedError({ messageID })) : Effect.failCause(cause),
+              ),
+            )
+            return { message, generation }
+          }),
+        )
+        if (input.noReply) return message
+        while (true) {
+          if (generation !== queue.generation) return message
+          if (entry?.state === "withdrawn") return message
+          const first = queue.pending.find((item) => item.generation === queue.generation || item.state === "ready")
+          if (entry?.state === "ready" && first && first.state !== "ready") {
+            yield* first.ready.await
+            continue
+          }
+          const result = yield* loop({ sessionID: input.sessionID }, message)
+          if (result.info.role === "assistant" && result.info.error) return result
+          // A prompt can join a runner after its last snapshot. Retry only while
+          // this admission still awaits claim, never after cancellation/error.
+          if (generation !== queue.generation || entry?.state !== "ready") return result
+        }
+      },
+      (effect, _input, options) =>
+        effect.pipe(
+          Effect.onExit((exit) =>
+            options?.admitted && Exit.isFailure(exit) ? Deferred.failCause(options.admitted, exit.cause) : Effect.void,
+          ),
+        ),
+    )
+
+    const lastAssistant = Effect.fnUntraced(function* (sessionID: SessionID, fallback?: SessionV1.WithParts) {
       const match = yield* sessions.findMessage(sessionID, (m) => m.info.role !== "user").pipe(Effect.orDie)
       if (Option.isSome(match)) return match.value
       const msgs = yield* sessions.messages({ sessionID, limit: 1 }).pipe(Effect.orDie)
       if (msgs.length > 0) return msgs[0]
+      if (fallback) return fallback
       throw new Error("Impossible")
     })
 
-    const runLoop: (sessionID: SessionID) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.run")(
-      function* (sessionID: SessionID) {
+    const runLoop: (sessionID: SessionID, fallback?: SessionV1.WithParts) => Effect.Effect<SessionV1.WithParts> =
+      Effect.fn("SessionPrompt.run")(function* (sessionID: SessionID, fallback?: SessionV1.WithParts) {
         const ctx = yield* InstanceState.context
         let structured: unknown
         let step = 0
         const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
+        const queue = yield* queueFor(sessionID)
+        const data = yield* InstanceState.get(queues)
 
         while (true) {
           yield* status.set(sessionID, { type: "busy" })
           yield* Effect.logInfo("loop", { "session.id": sessionID, step })
 
-          let msgs = yield* MessageV2.filterCompactedEffect(sessionID).pipe(
-            Effect.provideService(Database.Service, database),
+          const snapshot = yield* Effect.uninterruptibleMask((restore) =>
+            Effect.gen(function* () {
+              const generation = queue.generation
+              const candidates: PendingPrompt[] = []
+              for (const entry of queue.pending) {
+                // A cancelled resolver must not block new submissions. Already
+                // published ready prompts remain available to an explicit resume.
+                if (entry.generation !== generation && entry.state !== "ready") continue
+                if (entry.state !== "ready") break
+                candidates.push(entry)
+              }
+              // Admissions during the asynchronous read add their IDs to this
+              // exclusion set, even if they finish publication before the read.
+              const excluded = new Set(queue.hidden)
+              queue.reading = excluded
+              const messages = yield* restore(
+                MessageV2.stream(sessionID).pipe(Effect.provideService(Database.Service, database)),
+              ).pipe(
+                Effect.ensuring(
+                  Effect.sync(() => {
+                    queue.reading = undefined
+                  }),
+                ),
+              )
+              if (queue.closed || generation !== queue.generation)
+                return { messages: [] as SessionV1.WithParts[], permissions: undefined, selection: undefined }
+              const byID = new Map(messages.map((message) => [message.info.id, message]))
+              const claimed = candidates.filter((entry) => entry.state === "ready")
+              const history = messages.filter((message) => !excluded.has(message.info.id)).reverse()
+              // Model-only placement survives compaction that completed while an
+              // input was pending. Never rewrite persisted timestamps or history.
+              for (const [id, order] of queue.order) {
+                const index = history.findIndex((message) => message.info.id === id)
+                const anchor = history.findIndex((message) => message.info.id === order.after)
+                if (index >= 0 && index < anchor) history.splice(anchor, 0, history.splice(index, 1)[0])
+              }
+              // No yields from selection through ownership transfer and copying.
+              // A withdrawn/partially published input can never enter this snapshot.
+              for (const entry of claimed) {
+                const message = byID.get(entry.id)
+                entry.state = message ? "claimed" : "failed"
+                queue.hidden.delete(entry.id)
+                if (data.used.get(entry.id)?.sessionID === sessionID) data.used.delete(entry.id)
+                if (!message) continue
+                queue.order.set(entry.id, {
+                  after: history.at(-1)?.info.id,
+                  parts: new Map(entry.message!.parts.map((part, index) => [part.id, index])),
+                })
+                history.push(message)
+              }
+              queue.pending = queue.pending.filter((entry) => !claimed.includes(entry))
+              let time = -1
+              if (queue.order.size)
+                for (const message of history) {
+                  const order = queue.order.get(message.info.id)
+                  if (order)
+                    message.parts.sort(
+                      (a, b) => (order.parts.get(a.id) ?? Infinity) - (order.parts.get(b.id) ?? Infinity),
+                    )
+                  // latest() compares timestamps even after filterCompacted reorders
+                  // the retained tail. Project the local order onto these copies only.
+                  message.info.time.created = time = Math.max(message.info.time.created, time + 1)
+                }
+              const tools = claimed.findLast(
+                (entry) => entry.state === "claimed" && Object.keys(entry.input.tools ?? {}).length,
+              )?.input.tools
+              const permissions: PermissionV1.Rule[] | undefined =
+                tools &&
+                Object.entries(tools).map(([permission, enabled]) => ({
+                  permission,
+                  action: enabled ? "allow" : "deny",
+                  pattern: "*",
+                }))
+              const selection = claimed.findLast((entry) => entry.state === "claimed")?.message?.info
+              return { messages: MessageV2.filterCompacted(history.reverse()), permissions, selection }
+            }),
           )
+          // Selection follows admission/claim order, not asynchronous publication
+          // order. Withdrawn inputs cannot change subsequent prompts' defaults.
+          if (snapshot.selection?.role === "user")
+            yield* selectAgentModel(snapshot.selection, yield* sessions.get(sessionID).pipe(Effect.orDie))
+          if (snapshot.permissions) {
+            yield* sessions.setPermission({ sessionID, permission: snapshot.permissions })
+            session.permission = snapshot.permissions
+          }
+          let msgs = snapshot.messages
 
           const { user: lastUser, assistant: lastAssistant, finished: lastFinished, tasks } = MessageV2.latest(msgs)
 
+          if (!lastUser && fallback) return fallback
           if (!lastUser) throw new Error("No user message found in stream. This should never happen.")
 
           const lastAssistantMsg = msgs.findLast(
@@ -1138,18 +1521,20 @@ const layer = Layer.effect(
               history: msgs,
             }).pipe(Effect.ignore, Effect.forkIn(scope))
 
-          const model = yield* getModel(lastUser.model.providerID, lastUser.model.modelID, sessionID)
           const task = tasks.pop()
 
           if (task?.type === "subtask") {
-            yield* handleSubtask({ task, model, lastUser, sessionID, session, msgs })
+            const parent = msgs.find((message) => message.info.id === task.messageID)?.info
+            if (!parent || parent.role !== "user") throw new Error("Subtask parent must be a user message")
+            const model = yield* getModel(parent.model.providerID, parent.model.modelID, sessionID)
+            yield* handleSubtask({ task, model, lastUser: parent, sessionID, session, msgs })
             continue
           }
 
           if (task?.type === "compaction") {
             const result = yield* compaction.process({
               messages: msgs,
-              parentID: lastUser.id,
+              parentID: task.messageID,
               sessionID,
               auto: task.auto,
               overflow: task.overflow,
@@ -1158,6 +1543,7 @@ const layer = Layer.effect(
             continue
           }
 
+          const model = yield* getModel(lastUser.model.providerID, lastUser.model.modelID, sessionID)
           if (
             lastFinished &&
             lastFinished.summary !== true &&
@@ -1336,14 +1722,15 @@ const layer = Layer.effect(
         }
 
         yield* compaction.prune({ sessionID }).pipe(Effect.ignore, Effect.forkIn(scope))
-        return yield* lastAssistant(sessionID)
-      },
-    )
+        return yield* lastAssistant(sessionID, fallback)
+      })
 
-    const loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.loop")(function* (
-      input: LoopInput,
-    ) {
-      return yield* state.ensureRunning(input.sessionID, lastAssistant(input.sessionID), runLoop(input.sessionID))
+    const loop = Effect.fn("SessionPrompt.loop")(function* (input: LoopInput, fallback?: SessionV1.WithParts) {
+      return yield* state.ensureRunning(
+        input.sessionID,
+        lastAssistant(input.sessionID, fallback),
+        runLoop(input.sessionID, fallback),
+      )
     })
 
     const shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError> = Effect.fn(
@@ -1483,6 +1870,7 @@ const layer = Layer.effect(
     return Service.of({
       cancel,
       prompt,
+      withdraw,
       loop,
       shell,
       command,
@@ -1517,8 +1905,16 @@ export const PromptInput = Schema.Struct({
       SessionV1.SubtaskPartInput,
     ]).annotate({ discriminator: "type" }),
   ),
-})
+}).annotate({ identifier: "SessionPrompt.PromptInput" })
 export type PromptInput = Schema.Schema.Type<typeof PromptInput>
+
+export class PromptConflictError extends Schema.TaggedErrorClass<PromptConflictError>()("PromptConflictError", {
+  messageID: MessageID,
+}) {}
+
+export class PromptAbandonedError extends Schema.TaggedErrorClass<PromptAbandonedError>()("PromptAbandonedError", {
+  messageID: MessageID,
+}) {}
 
 export class LoopInput extends Schema.Class<LoopInput>("SessionPrompt.LoopInput")({
   sessionID: SessionID,

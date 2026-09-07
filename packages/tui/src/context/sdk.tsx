@@ -3,6 +3,7 @@ import type { GlobalEvent } from "@opencode-ai/sdk/v2"
 import { Flag } from "@opencode-ai/core/flag/flag"
 import { createSimpleContext } from "./helper"
 import { batch, onCleanup, onMount } from "solid-js"
+import { createPromptQueue } from "../prompt/queue"
 
 export type EventSource = {
   subscribe: (handler: (event: GlobalEvent) => void) => Promise<() => void>
@@ -139,6 +140,7 @@ export const { use: useSDK, provider: SDKProvider } = createSimpleContext({
     })
 
     return {
+      prompts: createPromptQueue(sdk),
       get client() {
         return sdk
       },

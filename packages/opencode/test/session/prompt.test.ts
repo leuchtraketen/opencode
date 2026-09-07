@@ -5,7 +5,7 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { eq } from "drizzle-orm"
 import { EventV2Bridge } from "@/event-v2-bridge"
-import { expect } from "bun:test"
+import { expect, spyOn } from "bun:test"
 import { Cause, Deferred, Duration, Effect, Exit, Fiber, Layer } from "effect"
 import path from "path"
 import { fileURLToPath } from "url"
@@ -50,7 +50,7 @@ import { Truncate } from "@/tool/truncate"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { Format } from "../../src/format"
-import { TestInstance } from "../fixture/fixture"
+import { reloadInstance, TestInstance } from "../fixture/fixture"
 import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
 import { reply, TestLLMServer } from "../lib/llm-server"
 import { RuntimeFlags } from "@/effect/runtime-flags"
@@ -336,7 +336,1307 @@ const waitForBusy = (sessionID: SessionID, duration: Duration.Input = "2 seconds
     duration,
   )
 
+const enqueue = Effect.fnUntraced(function* (input: SessionPrompt.PromptInput) {
+  const prompt = yield* SessionPrompt.Service
+  const admitted = yield* Deferred.make<
+    void,
+    Image.Error | SessionPrompt.PromptConflictError | SessionPrompt.PromptAbandonedError
+  >()
+  const fiber = yield* prompt.prompt(input, { admitted }).pipe(Effect.forkChild)
+  yield* awaitWithTimeout(Deferred.await(admitted), "prompt was not admitted")
+  return fiber
+})
+
+const visible = (messageID: MessageID) =>
+  pollWithTimeout(
+    MessageV2.parts(messageID).pipe(Effect.map((parts) => (parts.length ? true : undefined))),
+    "prepared prompt was not published",
+  )
+
+it.instance("withdraw returns every queued original payload once without aborting the provider turn", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const status = yield* SessionStatus.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+    const release = yield* Deferred.make<void>()
+    yield* llm.push(reply().wait(deferredAsPromise(release)).text("active work completed").stop())
+    const active = yield* prompt
+      .prompt({
+        sessionID: chat.id,
+        model: ref,
+        parts: [{ type: "text", text: "active work" }],
+      })
+      .pipe(Effect.forkChild)
+    yield* llm.wait(1)
+
+    const photon = yield* Effect.promise(() => import("@silvia-odwyer/photon-node"))
+    const source = new photon.PhotonImage(new Uint8Array(9_000 * 4).fill(255), 9_000, 1)
+    const image = {
+      type: "file" as const,
+      mime: "image/png",
+      filename: "original.png",
+      url: `data:image/png;base64,${Buffer.from(source.get_bytes()).toString("base64")}`,
+    }
+    source.free()
+    const ids = [MessageID.ascending(), MessageID.ascending(), MessageID.ascending()].reverse()
+    const inputs: SessionPrompt.PromptInput[] = [
+      {
+        sessionID: chat.id,
+        messageID: ids[0],
+        model: ref,
+        agent: "build",
+        parts: [
+          { type: "text", text: "first @notes.txt @explore" },
+          {
+            id: PartID.ascending(),
+            type: "file",
+            mime: "text/plain",
+            filename: "notes.txt",
+            url: "data:text/plain;base64,b3JpZ2luYWwgZmlsZQ==",
+            source: { type: "file", path: "/original/notes.txt", text: { value: "@notes.txt", start: 6, end: 16 } },
+          },
+          { type: "agent", name: "explore", source: { value: "@explore", start: 17, end: 25 } },
+        ],
+      },
+      {
+        sessionID: chat.id,
+        messageID: ids[1],
+        model: ref,
+        parts: [
+          { type: "text", text: "second queued prompt" },
+          {
+            type: "file",
+            mime: "application/pdf",
+            url: "data:application/pdf;base64,cGRm",
+            filename: "attachment.pdf",
+          },
+        ],
+      },
+      {
+        sessionID: chat.id,
+        messageID: ids[2],
+        model: ref,
+        parts: [{ type: "text", text: "third queued prompt" }, image],
+      },
+    ]
+    const queued = []
+    for (const input of inputs) {
+      queued.push(yield* enqueue(input))
+      yield* visible(input.messageID!)
+    }
+    expect(
+      (yield* sessions.messages({ sessionID: chat.id })).filter((message) => message.info.role === "user"),
+    ).toHaveLength(4)
+    const results = yield* Effect.all(
+      [prompt.withdraw(chat.id, "client-one"), prompt.withdraw(chat.id, "client-two")],
+      {
+        concurrency: "unbounded",
+      },
+    )
+    expect(results.flat()).toEqual(inputs)
+    expect(results.filter((result) => result.length === 0)).toHaveLength(1)
+    expect(yield* status.get(chat.id)).toEqual({ type: "busy" })
+    expect(yield* llm.calls).toBe(1)
+    expect(
+      (yield* sessions.messages({ sessionID: chat.id })).filter((message) => message.info.role === "user"),
+    ).toHaveLength(1)
+    expect(yield* prompt.withdraw(chat.id, "empty")).toEqual([])
+
+    yield* Deferred.succeed(release, undefined)
+    const result = yield* awaitWithTimeout(Fiber.join(active), "withdraw interrupted active work", "10 seconds")
+    yield* Effect.forEach(queued, Fiber.join)
+    expect(result.parts.some((part) => part.type === "text" && part.text === "active work completed")).toBe(true)
+    expect(yield* llm.calls).toBe(1)
+    expect(JSON.stringify(yield* llm.inputs)).not.toContain("queued prompt")
+    const retry = yield* prompt.prompt(inputs[0]).pipe(Effect.exit)
+    expect(Exit.isFailure(retry)).toBe(true)
+    if (Exit.isFailure(retry)) expect(Cause.squash(retry.cause)).toBeInstanceOf(SessionPrompt.PromptConflictError)
+    expect(yield* prompt.withdraw(chat.id, "empty")).toEqual([])
+  }),
+)
+
+it.instance("withdraw can remove the first prepared prompt before the runner takes its snapshot", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const events = yield* EventV2Bridge.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+    const input: SessionPrompt.PromptInput = {
+      sessionID: chat.id,
+      messageID: MessageID.ascending(),
+      model: ref,
+      parts: [{ type: "text", text: "withdraw before snapshot" }],
+    }
+    let withdrawn: SessionPrompt.PromptInput[] = []
+    const off = yield* events.listen((event) => {
+      if (event.type !== SessionStatus.Event.Status.type) return Effect.void
+      const data = event.data as typeof SessionStatus.Event.Status.data.Type
+      if (data.sessionID !== chat.id || data.status.type !== "busy") return Effect.void
+      return prompt.withdraw(chat.id, "before-snapshot").pipe(
+        Effect.tap((inputs) =>
+          Effect.sync(() => {
+            withdrawn = inputs
+          }),
+        ),
+        Effect.asVoid,
+      )
+    })
+    yield* Effect.addFinalizer(() => off)
+    yield* prompt.prompt(input)
+    expect(withdrawn).toEqual([input])
+    expect(yield* llm.calls).toBe(0)
+    expect(yield* sessions.messages({ sessionID: chat.id })).toEqual([])
+  }),
+)
+
+it.instance("withdraw excludes followups already selected by the next provider turn", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+    const first = yield* Deferred.make<void>()
+    const second = yield* Deferred.make<void>()
+    yield* llm.push(
+      reply().wait(deferredAsPromise(first)).text("first response").stop(),
+      reply().wait(deferredAsPromise(second)).text("second response").stop(),
+    )
+    const active = yield* prompt
+      .prompt({ sessionID: chat.id, model: ref, parts: [{ type: "text", text: "first" }] })
+      .pipe(Effect.forkChild)
+    yield* llm.wait(1)
+    const input = {
+      sessionID: chat.id,
+      messageID: MessageID.ascending(),
+      model: ref,
+      parts: [{ type: "text" as const, text: "next-turn followup" }],
+    }
+    const followup = yield* enqueue(input)
+    yield* Deferred.succeed(first, undefined)
+    yield* llm.wait(2)
+    expect(JSON.stringify((yield* llm.inputs)[1])).toContain("next-turn followup")
+    expect(yield* prompt.withdraw(chat.id, "claimed")).toEqual([])
+    yield* Deferred.succeed(second, undefined)
+    yield* Fiber.join(active)
+    yield* Fiber.join(followup)
+    expect(yield* prompt.withdraw(chat.id, "after")).toEqual([])
+    expect(
+      (yield* sessions.messages({ sessionID: chat.id })).some((message) => message.info.id === input.messageID),
+    ).toBe(true)
+  }),
+)
+
+for (const fail of [false, true])
+  it.instance(`withdraw includes in-flight file resolution without late publication${fail ? " or errors" : ""}`, () =>
+    Effect.gen(function* () {
+      const { dir, llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const registry = yield* ToolRegistry.Service
+      const events = yield* EventV2Bridge.Service
+      const errors: unknown[] = []
+      yield* events.listen((event) =>
+        Effect.sync(() => {
+          if (event.type === Session.Event.Error.type) errors.push(event.data)
+        }),
+      )
+      const { read } = yield* registry.named()
+      const original = read.execute
+      const resolving = yield* Deferred.make<void>()
+      const finish = yield* Deferred.make<void>()
+      read.execute = (args, ctx) =>
+        Deferred.succeed(resolving, undefined).pipe(
+          Effect.andThen(Deferred.await(finish)),
+          Effect.andThen(fail ? Effect.die(new Error("late read failure")) : original(args, ctx)),
+        )
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          read.execute = original
+        }),
+      )
+      const chat = yield* sessions.create({ title: "Pinned" })
+      const release = yield* Deferred.make<void>()
+      yield* llm.push(reply().wait(deferredAsPromise(release)).text("done").stop())
+      const active = yield* prompt
+        .prompt({ sessionID: chat.id, model: ref, parts: [{ type: "text", text: "active" }] })
+        .pipe(Effect.forkChild)
+      yield* llm.wait(1)
+      yield* writeText(path.join(dir, "slow.txt"), "file content")
+      const slow: SessionPrompt.PromptInput = {
+        sessionID: chat.id,
+        messageID: MessageID.ascending(),
+        model: ref,
+        parts: [
+          { type: "text", text: "slow first" },
+          { type: "file", mime: "text/plain", url: `file://${path.join(dir, "slow.txt")}`, filename: "slow.txt" },
+        ],
+      }
+      const slowFiber = yield* prompt.prompt(slow).pipe(Effect.forkChild)
+      yield* awaitWithTimeout(Deferred.await(resolving), "file resolution never started", "10 seconds")
+      const fast: SessionPrompt.PromptInput = {
+        sessionID: chat.id,
+        messageID: MessageID.ascending(),
+        model: ref,
+        parts: [{ type: "text", text: "fast second" }],
+      }
+      const fastFiber = yield* enqueue(fast)
+      expect(yield* prompt.withdraw(chat.id, "both")).toEqual([slow, fast])
+      yield* Deferred.succeed(finish, undefined)
+      yield* awaitWithTimeout(Fiber.join(slowFiber), "withdrawn resolution did not finish", "10 seconds")
+      expect(
+        (yield* sessions.messages({ sessionID: chat.id })).some(
+          (message) => message.info.id === slow.messageID || message.info.id === fast.messageID,
+        ),
+      ).toBe(false)
+      yield* Deferred.succeed(release, undefined)
+      yield* Fiber.join(active)
+      yield* Fiber.join(fastFiber)
+      expect(yield* llm.calls).toBe(1)
+      expect(errors).toEqual([])
+    }),
+  )
+
+noLLMServer.instance(
+  "withdraw preserves raw input while a chat.message plugin is still resolving",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const plugin = yield* Plugin.Service
+      const hooks = yield* plugin.list()
+      const started = defer<void>()
+      const release = defer<void>()
+      const hook = {
+        "chat.message": async (_input: unknown, output: { parts: Array<{ type: string; text?: string }> }) => {
+          const text = output.parts.find((part) => part.type === "text")
+          if (text) text.text = "plugin transformed text"
+          started.resolve()
+          await release.promise
+        },
+      }
+      hooks.push(hook)
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          hooks.splice(hooks.indexOf(hook), 1)
+          release.resolve()
+        }),
+      )
+      const chat = yield* sessions.create({ title: "Plugin race" })
+      const events = yield* EventV2Bridge.Service
+      let removals = 0
+      yield* events.listen((event) =>
+        Effect.sync(() => {
+          if (event.type === SessionV1.Event.MessageRemoved.type) removals++
+        }),
+      )
+      const input: SessionPrompt.PromptInput = {
+        sessionID: chat.id,
+        messageID: MessageID.ascending(),
+        model: ref,
+        parts: [{ type: "text", text: "original text" }],
+      }
+      const fiber = yield* prompt.prompt(input).pipe(Effect.forkChild)
+      yield* awaitWithTimeout(
+        Effect.promise(() => started.promise),
+        "plugin did not start",
+        "10 seconds",
+      )
+      const receipt = yield* prompt.withdraw(chat.id, "retry")
+      expect(receipt).toEqual([input])
+      Object.assign(receipt[0], { agent: "mutated receipt" })
+      const later = { ...input, messageID: MessageID.ascending() }
+      const laterFiber = yield* enqueue(later)
+      expect(yield* prompt.withdraw(chat.id, "retry")).toEqual([input])
+      expect(yield* prompt.withdraw(chat.id, "later")).toEqual([later])
+      release.resolve()
+      yield* Fiber.join(fiber)
+      yield* Fiber.join(laterFiber)
+      expect(yield* sessions.messages({ sessionID: chat.id })).toEqual([])
+      expect(yield* prompt.withdraw(chat.id, "empty")).toEqual([])
+      expect(removals).toBe(0)
+    }),
+  { config: cfg },
+)
+
+noLLMServer.instance(
+  "withdraw is session isolated and preserves noReply and synthetic messages",
+  () =>
+    Effect.gen(function* () {
+      const { directory: dir } = yield* TestInstance
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const registry = yield* ToolRegistry.Service
+      const { read } = yield* registry.named()
+      const original = read.execute
+      const finish = yield* Deferred.make<void>()
+      read.execute = (args, ctx) => Deferred.await(finish).pipe(Effect.andThen(original(args, ctx)))
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          read.execute = original
+        }),
+      )
+      const chats = [yield* sessions.create({ title: "One" }), yield* sessions.create({ title: "Two" })]
+      yield* writeText(path.join(dir, "hold.txt"), "hold")
+      const inputs = chats.map((chat) => ({
+        sessionID: chat.id,
+        messageID: MessageID.ascending(),
+        model: ref,
+        parts: [
+          {
+            type: "file" as const,
+            mime: "text/plain",
+            url: `file://${path.join(dir, "hold.txt")}`,
+            filename: "hold.txt",
+          },
+        ],
+      }))
+      const fibers = yield* Effect.forEach(inputs, enqueue)
+      const admitted = yield* Deferred.make<
+        void,
+        Image.Error | SessionPrompt.PromptConflictError | SessionPrompt.PromptAbandonedError
+      >()
+      const task = yield* prompt
+        .prompt({ ...inputs[0], messageID: MessageID.ascending() }, { admitted, task: true })
+        .pipe(Effect.forkChild)
+      yield* Deferred.await(admitted)
+      const noReply = yield* prompt.prompt({
+        sessionID: chats[0].id,
+        model: ref,
+        noReply: true,
+        parts: [{ type: "text", text: "keep noReply" }],
+      })
+      const synthetic = yield* user(chats[0].id, "synthetic history")
+      const part = (yield* MessageV2.get({ sessionID: chats[0].id, messageID: synthetic.id })).parts[0]
+      if (part.type === "text") yield* sessions.updatePart({ ...part, synthetic: true })
+      const compaction = yield* SessionCompaction.Service
+      yield* compaction.create({ sessionID: chats[0].id, agent: "build", model: ref, auto: true })
+      const kept = yield* sessions.messages({ sessionID: chats[0].id })
+      expect(yield* prompt.withdraw(chats[0].id, "one")).toEqual([inputs[0]])
+      expect(yield* prompt.withdraw(chats[1].id, "two")).toEqual([inputs[1]])
+      yield* Fiber.interrupt(task)
+      yield* Deferred.succeed(finish, undefined)
+      yield* Effect.forEach(fibers, Fiber.join)
+      expect(yield* sessions.messages({ sessionID: chats[0].id })).toEqual(kept)
+      expect(kept.some((message) => message.info.id === noReply.info.id)).toBe(true)
+    }),
+  { config: cfg },
+)
+
 const hasBash = Effect.sync(() => Bun.which("bash") !== null)
+
+it.instance("claim applies original tool permissions before preparing the provider request", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const plugin = yield* Plugin.Service
+    const hooks = yield* plugin.list()
+    const hook = {
+      "chat.message": async (_input: unknown, output: { message: { tools?: Record<string, boolean> } }) => {
+        output.message.tools = { read: true }
+      },
+    }
+    hooks.push(hook)
+    yield* Effect.addFinalizer(() =>
+      Effect.sync(() => {
+        hooks.splice(hooks.indexOf(hook), 1)
+      }),
+    )
+    const chat = yield* sessions.create({ title: "Pinned" })
+    yield* llm.text("done")
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      model: ref,
+      tools: { read: false },
+      parts: [{ type: "text", text: "keep read disabled" }],
+    })
+    expect((yield* sessions.get(chat.id)).permission).toEqual([{ permission: "read", action: "deny", pattern: "*" }])
+    expect(JSON.stringify((yield* llm.inputs)[0].tools)).not.toContain('"name":"read"')
+    expect(JSON.stringify((yield* llm.inputs)[0].tools)).toContain('"name":"bash"')
+  }),
+)
+
+noLLMServer.instance(
+  "cancel during preparation leaves the input withdrawable without starting a model",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const plugin = yield* Plugin.Service
+      const hooks = yield* plugin.list()
+      const started = defer<void>()
+      const release = defer<void>()
+      const hook = {
+        "chat.message": async () => {
+          started.resolve()
+          await release.promise
+        },
+      }
+      hooks.push(hook)
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          release.resolve()
+          hooks.splice(hooks.indexOf(hook), 1)
+        }),
+      )
+      const chat = yield* sessions.create({ title: "Pinned" })
+      const input = {
+        sessionID: chat.id,
+        model: ref,
+        parts: [{ type: "text" as const, text: "cancelled preparation" }],
+      }
+      const fiber = yield* enqueue(input)
+      yield* awaitWithTimeout(
+        Effect.promise(() => started.promise),
+        "preparation did not start",
+      )
+      yield* prompt.cancel(chat.id)
+      release.resolve()
+      yield* awaitWithTimeout(Fiber.join(fiber), "cancelled preparation started a model")
+      expect(yield* prompt.withdraw(chat.id, "cancelled")).toEqual([input])
+      expect(yield* sessions.messages({ sessionID: chat.id })).toEqual([])
+    }),
+  { config: cfg },
+)
+
+noLLMServer.instance(
+  "instance disposal discards admissions and receipts and prevents late publication",
+  () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const plugin = yield* Plugin.Service
+      const hooks = yield* plugin.list()
+      const release = defer<void>()
+      const hook = {
+        "chat.message": async () => {
+          await release.promise
+        },
+      }
+      hooks.push(hook)
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          release.resolve()
+          hooks.splice(hooks.indexOf(hook), 1)
+        }),
+      )
+      const chat = yield* sessions.create({ title: "Pinned" })
+      const input = { sessionID: chat.id, model: ref, parts: [{ type: "text" as const, text: "discarded" }] }
+      const first = yield* enqueue(input)
+      expect(yield* prompt.withdraw(chat.id, "receipt")).toEqual([input])
+      const second = yield* enqueue(input)
+      yield* reloadInstance({ directory: test.directory })
+      expect(yield* prompt.withdraw(chat.id, "receipt")).toEqual([])
+      release.resolve()
+      yield* Fiber.join(first)
+      yield* Fiber.join(second)
+      expect(yield* sessions.messages({ sessionID: chat.id })).toEqual([])
+    }),
+  { config: cfg },
+)
+
+it.instance("admission order survives slow preparation and nonmonotonic prompt and attachment IDs", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const plugin = yield* Plugin.Service
+    const hooks = yield* plugin.list()
+    const started = defer<void>()
+    const release = defer<void>()
+    const hook = {
+      "chat.message": async (input: { messageID?: string }) => {
+        if (input.messageID !== "msg_z_first") return
+        started.resolve()
+        await release.promise
+      },
+    }
+    hooks.push(hook)
+    yield* Effect.addFinalizer(() =>
+      Effect.sync(() => {
+        release.resolve()
+        hooks.splice(hooks.indexOf(hook), 1)
+      }),
+    )
+    const chat = yield* sessions.create({ title: "Pinned" })
+    yield* llm.text("done")
+    const first = yield* prompt
+      .prompt({
+        sessionID: chat.id,
+        messageID: MessageID.make("msg_z_first"),
+        model: ref,
+        parts: [
+          { id: PartID.make("prt_z_first"), type: "text", text: "first text" },
+          {
+            id: PartID.make("prt_a_second"),
+            type: "file",
+            mime: "text/plain",
+            filename: "note.txt",
+            url: "data:text/plain,attachment content",
+          },
+          { id: PartID.make("prt_m_third"), type: "text", text: "last text" },
+        ],
+      })
+      .pipe(Effect.forkChild)
+    yield* awaitWithTimeout(
+      Effect.promise(() => started.promise),
+      "first preparation did not start",
+    )
+    const second = yield* enqueue({
+      sessionID: chat.id,
+      messageID: MessageID.make("msg_a_second"),
+      model: ref,
+      parts: [{ type: "text", text: "second prompt" }],
+    })
+    expect(yield* llm.calls).toBe(0)
+    release.resolve()
+    yield* Fiber.join(first)
+    const result = yield* Fiber.join(second)
+    expect(yield* llm.calls).toBe(1)
+    expect(result.info.role === "assistant" && result.info.parentID).toBe(MessageID.make("msg_a_second"))
+    const input = JSON.stringify((yield* llm.inputs)[0])
+    expect(input.indexOf("first text")).toBeLessThan(input.indexOf("attachment content"))
+    expect(input.indexOf("attachment content")).toBeLessThan(input.indexOf("last text"))
+    expect(input.indexOf("last text")).toBeLessThan(input.indexOf("second prompt"))
+    expect(yield* prompt.withdraw(chat.id, "claimed")).toEqual([])
+  }),
+)
+
+for (const withdrawLater of [false, true])
+  it.instance(
+    `saved model follows ${withdrawLater ? "the active prompt, not a withdrawn followup" : "admission order despite delayed preparation"}`,
+    () =>
+      Effect.gen(function* () {
+        const { llm } = yield* useServerConfig((url) => {
+          const config = providerCfg(url)
+          return {
+            ...config,
+            provider: {
+              test: {
+                ...config.provider.test,
+                models: {
+                  ...config.provider.test.models,
+                  "test-model-b": { ...config.provider.test.models["test-model"], id: "test-model-b" },
+                },
+              },
+            },
+          }
+        })
+        const prompt = yield* SessionPrompt.Service
+        const sessions = yield* Session.Service
+        const plugin = yield* Plugin.Service
+        const hooks = yield* plugin.list()
+        const firstID = MessageID.ascending()
+        const started = defer<void>()
+        const prepare = defer<void>()
+        const response = yield* Deferred.make<void>()
+        const hook = {
+          "chat.message": async (input: { messageID?: string }) => {
+            if (input.messageID !== firstID) return
+            started.resolve()
+            await prepare.promise
+          },
+        }
+        hooks.push(hook)
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => {
+            prepare.resolve()
+            hooks.splice(hooks.indexOf(hook), 1)
+          }),
+        )
+        const chat = yield* sessions.create({ title: "Pinned" })
+        const modelB = { providerID: ref.providerID, modelID: ModelV2.ID.make("test-model-b") }
+        yield* llm.push(
+          reply().wait(deferredAsPromise(response)).text("first response").stop(),
+          reply().text("next response").stop(),
+          reply().text("followup response").stop(),
+        )
+        const first = yield* enqueue({
+          sessionID: chat.id,
+          messageID: firstID,
+          model: ref,
+          parts: [{ type: "text", text: "slow model A" }],
+        })
+        yield* awaitWithTimeout(
+          Effect.promise(() => started.promise),
+          "model A preparation did not start",
+          "10 seconds",
+        )
+        if (withdrawLater) {
+          prepare.resolve()
+          yield* llm.wait(1)
+        }
+        const input = {
+          sessionID: chat.id,
+          messageID: MessageID.ascending(),
+          model: modelB,
+          parts: [{ type: "text" as const, text: "fast model B" }],
+        }
+        const second = yield* enqueue(input)
+        yield* visible(input.messageID)
+        if (withdrawLater) {
+          expect(yield* prompt.withdraw(chat.id, "withdraw-model-b")).toEqual([input])
+          expect((yield* sessions.get(chat.id)).model?.id).toBe(ref.modelID)
+        }
+        prepare.resolve()
+        yield* llm.wait(1)
+        yield* Deferred.succeed(response, undefined)
+        yield* Fiber.join(first)
+        yield* Fiber.join(second)
+        const expected = withdrawLater ? ref.modelID : modelB.modelID
+        expect((yield* sessions.get(chat.id)).model?.id).toBe(expected)
+        const followup = yield* prompt.prompt({
+          sessionID: chat.id,
+          agent: "build",
+          parts: [{ type: "text", text: "inherit the saved model" }],
+        })
+        expect(followup.info.role === "assistant" && followup.info.modelID).toBe(expected)
+        expect((yield* llm.inputs).at(-1)?.model).toBe(expected)
+        if (withdrawLater) expect(JSON.stringify(yield* llm.inputs)).not.toContain("fast model B")
+      }),
+  )
+
+noLLMServer.instance(
+  "failed publication removes its partial message",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const events = yield* EventV2Bridge.Service
+      const chat = yield* sessions.create({ title: "Pinned" })
+      const id = MessageID.ascending()
+      const observed: string[] = []
+      yield* events.listen((event) =>
+        Effect.sync(() => {
+          observed.push(event.type)
+        }),
+      )
+      yield* events.project(SessionV1.Event.PartUpdated, (event) =>
+        event.data.part.type === "text" && event.data.part.text === "fail publication"
+          ? Effect.die("publication failed")
+          : Effect.void,
+      )
+      const result = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          messageID: id,
+          model: ref,
+          parts: [
+            { type: "text", text: "first part" },
+            { type: "text", text: "fail publication" },
+          ],
+        })
+        .pipe(Effect.exit)
+      expect(Exit.isFailure(result)).toBe(true)
+      expect(yield* sessions.messages({ sessionID: chat.id })).toEqual([])
+      expect(observed).toContain(SessionV1.Event.MessageRemoved.type)
+      expect(yield* prompt.withdraw(chat.id, "failed")).toEqual([])
+    }),
+  { config: cfg },
+)
+
+noLLMServer.instance(
+  "concurrent admissions reserve message identity",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chats = [yield* sessions.create({ title: "One" }), yield* sessions.create({ title: "Two" })]
+      const messageID = MessageID.ascending()
+      const partID = PartID.ascending()
+      const results = yield* Effect.all(
+        chats.map((chat) =>
+          prompt
+            .prompt({
+              sessionID: chat.id,
+              messageID,
+              model: ref,
+              noReply: true,
+              parts: [{ id: partID, type: "text", text: "original" }],
+            })
+            .pipe(Effect.exit),
+        ),
+        { concurrency: "unbounded" },
+      )
+      expect(results.filter(Exit.isSuccess)).toHaveLength(1)
+      const conflict = results.find(Exit.isFailure)!
+      expect(Cause.squash(conflict.cause)).toBeInstanceOf(SessionPrompt.PromptConflictError)
+      const messages = (yield* Effect.forEach(chats, (chat) => sessions.messages({ sessionID: chat.id }))).flat()
+      expect(messages).toHaveLength(1)
+      expect(messages[0].parts).toMatchObject([{ id: partID, type: "text", text: "original" }])
+    }),
+  { config: cfg },
+)
+
+raceNoLLMServer.instance(
+  "snapshot ownership precedes processor preparation",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const started = defer<void>()
+      processorCreateStarted.push(started.resolve)
+      const chat = yield* sessions.create({ title: "Pinned" })
+      const activeID = MessageID.ascending()
+      const active = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          messageID: activeID,
+          model: ref,
+          parts: [{ type: "text", text: "active preparation" }],
+        })
+        .pipe(Effect.forkChild)
+      yield* awaitWithTimeout(
+        Effect.promise(() => started.promise),
+        "processor preparation did not start",
+      )
+      const input = {
+        sessionID: chat.id,
+        messageID: MessageID.ascending(),
+        model: ref,
+        parts: [{ type: "text" as const, text: "queued during preparation" }],
+      }
+      const queued = yield* enqueue(input)
+      expect(yield* prompt.withdraw(chat.id, "preparation")).toEqual([input])
+      yield* prompt.cancel(chat.id)
+      yield* Fiber.join(active)
+      yield* Fiber.join(queued)
+      expect((yield* sessions.messages({ sessionID: chat.id })).some((message) => message.info.id === activeID)).toBe(
+        true,
+      )
+    }),
+  { config: cfg },
+)
+
+it.instance("interrupted preparation is cleaned up and does not block a later admitted prompt", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const registry = yield* ToolRegistry.Service
+    const { read } = yield* registry.named()
+    const original = read.execute
+    const started = yield* Deferred.make<void>()
+    read.execute = () => Deferred.succeed(started, undefined).pipe(Effect.andThen(Effect.never))
+    yield* Effect.addFinalizer(() =>
+      Effect.sync(() => {
+        read.execute = original
+      }),
+    )
+    const chat = yield* sessions.create({ title: "Pinned" })
+    const id = MessageID.ascending()
+    const first = yield* prompt
+      .prompt({
+        sessionID: chat.id,
+        messageID: id,
+        model: ref,
+        parts: [{ type: "file", mime: "text/plain", url: "file:///pending.txt" }],
+      })
+      .pipe(Effect.forkChild)
+    yield* awaitWithTimeout(Deferred.await(started), "file resolution did not start")
+    yield* llm.text("done")
+    const next = MessageID.ascending()
+    const second = yield* enqueue({
+      sessionID: chat.id,
+      messageID: next,
+      model: ref,
+      parts: [{ type: "text", text: "surviving prompt" }],
+    })
+    yield* Fiber.interrupt(first)
+    yield* awaitWithTimeout(Fiber.join(second), "failed resolution blocked the queue")
+    expect(yield* llm.calls).toBe(1)
+    expect((yield* sessions.messages({ sessionID: chat.id })).some((message) => message.info.id === id)).toBe(false)
+    expect(yield* prompt.withdraw(chat.id, "after-interruption")).toEqual([])
+  }),
+)
+
+it.instance("compaction claims its snapshot and retains its own parent when a followup is newer", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const compaction = yield* SessionCompaction.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+    const first = yield* Deferred.make<void>()
+    const compact = yield* Deferred.make<void>()
+    yield* llm.push(
+      reply().wait(deferredAsPromise(first)).text("first response").stop(),
+      reply().wait(deferredAsPromise(compact)).text("compacted history").stop(),
+      reply().text("done").stop(),
+    )
+    const active = yield* prompt
+      .prompt({ sessionID: chat.id, model: ref, parts: [{ type: "text", text: "initial" }] })
+      .pipe(Effect.forkChild)
+    yield* llm.wait(1)
+    yield* compaction.create({ sessionID: chat.id, agent: "build", model: ref, auto: true })
+    const marker = (yield* sessions.messages({ sessionID: chat.id })).find((message) =>
+      message.parts.some((part) => part.type === "compaction"),
+    )!
+    const followupID = MessageID.ascending()
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      messageID: followupID,
+      model: ref,
+      noReply: true,
+      parts: [{ type: "text", text: "included in compaction" }],
+    })
+    yield* Deferred.succeed(first, undefined)
+    yield* llm.wait(2)
+    expect(JSON.stringify((yield* llm.inputs)[1])).toContain("included in compaction")
+    const queued = {
+      sessionID: chat.id,
+      messageID: MessageID.ascending(),
+      model: ref,
+      parts: [{ type: "text" as const, text: "withdraw while compacting" }],
+    }
+    const queuedFiber = yield* enqueue(queued)
+    expect(yield* prompt.withdraw(chat.id, "compacting")).toEqual([queued])
+    yield* Deferred.succeed(compact, undefined)
+    yield* Fiber.join(active)
+    yield* Fiber.join(queuedFiber)
+    const summary = (yield* sessions.messages({ sessionID: chat.id })).find(
+      (message) => message.info.role === "assistant" && message.info.summary,
+    )
+    expect(summary?.info.role === "assistant" && summary.info.parentID).toBe(marker.info.id)
+    expect(JSON.stringify(yield* llm.inputs)).not.toContain("withdraw while compacting")
+  }),
+)
+
+it.instance("visible pending prompts survive compaction and subsequent provider turns in admission order", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const compaction = yield* SessionCompaction.Service
+    const plugin = yield* Plugin.Service
+    const hooks = yield* plugin.list()
+    const started = defer<void>()
+    const release = defer<void>()
+    const id = MessageID.ascending()
+    const hook = {
+      "chat.message": async (input: { messageID?: string }) => {
+        if (input.messageID !== id) return
+        started.resolve()
+        await release.promise
+      },
+    }
+    hooks.push(hook)
+    yield* Effect.addFinalizer(() =>
+      Effect.sync(() => {
+        release.resolve()
+        hooks.splice(hooks.indexOf(hook), 1)
+      }),
+    )
+    const chat = yield* sessions.create({ title: "Pinned" })
+    yield* llm.text("initial response")
+    yield* prompt.prompt({ sessionID: chat.id, model: ref, parts: [{ type: "text", text: "initial question" }] })
+    const pending = yield* prompt
+      .prompt({
+        sessionID: chat.id,
+        messageID: id,
+        model: ref,
+        parts: [{ type: "text", text: "slow prompt must survive" }],
+      })
+      .pipe(Effect.forkChild)
+    yield* awaitWithTimeout(
+      Effect.promise(() => started.promise),
+      "slow prompt did not start",
+    )
+    const secondID = MessageID.ascending()
+    const second = yield* enqueue({
+      sessionID: chat.id,
+      messageID: secondID,
+      model: ref,
+      parts: [{ type: "text", text: "visible pending prompt must survive" }],
+    })
+    yield* visible(secondID)
+    yield* compaction.create({ sessionID: chat.id, agent: "build", model: ref, auto: false })
+    yield* llm.text("compacted history")
+    yield* prompt.loop({ sessionID: chat.id })
+    expect(JSON.stringify(yield* llm.inputs)).not.toContain("slow prompt must survive")
+    expect(JSON.stringify(yield* llm.inputs)).not.toContain("visible pending prompt must survive")
+    yield* llm.push(reply().text("continuing"), reply().text("answered both prompts").stop())
+    release.resolve()
+    const result = yield* awaitWithTimeout(Fiber.join(pending), "compaction hid the pending prompt")
+    yield* Fiber.join(second)
+    expect(result.info).toMatchObject({ role: "assistant", parentID: secondID })
+    expect(yield* llm.calls).toBe(4)
+    for (const input of (yield* llm.inputs).slice(2).map((input) => JSON.stringify(input))) {
+      expect(input).toContain("slow prompt must survive")
+      expect(input).toContain("visible pending prompt must survive")
+      expect(input.indexOf("compacted history")).toBeLessThan(input.indexOf("slow prompt must survive"))
+      expect(input.indexOf("slow prompt must survive")).toBeLessThan(
+        input.indexOf("visible pending prompt must survive"),
+      )
+    }
+    expect(yield* prompt.withdraw(chat.id, "after-compaction")).toEqual([])
+  }),
+)
+
+it.instance("message-update observers can withdraw reentrantly before publication finishes", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const events = yield* EventV2Bridge.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+    const input = {
+      sessionID: chat.id,
+      messageID: MessageID.ascending(),
+      model: ref,
+      parts: [{ type: "text" as const, text: "withdraw from observer" }],
+    }
+    const observed: string[] = []
+    let withdrawn: SessionPrompt.PromptInput[] = []
+    yield* events.listen((event) =>
+      Effect.gen(function* () {
+        observed.push(event.type)
+        if (event.type !== SessionV1.Event.MessageUpdated.type) return
+        withdrawn = yield* prompt.withdraw(chat.id, "observer")
+      }),
+    )
+    yield* awaitWithTimeout(prompt.prompt(input), "withdrawal deadlocked in an event listener")
+    expect(withdrawn).toEqual([input])
+    expect(observed).toContain(SessionV1.Event.MessageRemoved.type)
+    expect(observed).not.toContain(SessionV1.Event.PartUpdated.type)
+    expect(
+      (yield* sessions.messages({ sessionID: chat.id })).some((message) => message.info.id === input.messageID),
+    ).toBe(false)
+    expect(yield* llm.calls).toBe(0)
+  }),
+)
+
+for (const noReply of [false, true])
+  it.instance(`partial ${noReply ? "noReply" : "user"} publication cannot enter a runner snapshot`, () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const events = yield* EventV2Bridge.Service
+      const chat = yield* sessions.create({ title: "Pinned" })
+      const previous = yield* seed(chat.id, { finish: "stop" })
+      const id = MessageID.ascending()
+      const started = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      yield* events.listen((event) => {
+        if (event.type !== SessionV1.Event.MessageUpdated.type) return Effect.void
+        const data = event.data as typeof SessionV1.Event.MessageUpdated.data.Type
+        return data.info.id === id
+          ? Deferred.succeed(started, undefined).pipe(Effect.andThen(Deferred.await(release)))
+          : Effect.void
+      })
+      const fiber = yield* enqueue({
+        sessionID: chat.id,
+        messageID: id,
+        model: ref,
+        noReply,
+        parts: [{ type: "text", text: "fully prepared input" }],
+      })
+      yield* Effect.addFinalizer(() => Deferred.succeed(release, undefined))
+      yield* awaitWithTimeout(Deferred.await(started), "publication did not start")
+      expect((yield* MessageV2.get({ sessionID: chat.id, messageID: id })).parts).toEqual([])
+      expect((yield* prompt.loop({ sessionID: chat.id })).info.id).toBe(previous.assistant.id)
+      expect(yield* llm.calls).toBe(0)
+      yield* llm.text("done")
+      yield* Deferred.succeed(release, undefined)
+      yield* Fiber.join(fiber)
+      if (noReply) yield* prompt.loop({ sessionID: chat.id })
+      expect(yield* llm.calls).toBe(1)
+      expect(JSON.stringify(yield* llm.inputs)).toContain("fully prepared input")
+    }),
+  )
+
+for (const remove of [false, true])
+  it.instance(
+    `snapshot reads exclude late admissions${remove ? " and withdrawn copies" : " until the next turn"}`,
+    () =>
+      Effect.gen(function* () {
+        const { llm } = yield* useServerConfig(providerCfg)
+        const prompt = yield* SessionPrompt.Service
+        const sessions = yield* Session.Service
+        const chat = yield* sessions.create({ title: "Pinned" })
+        const previous = yield* seed(chat.id, { finish: "stop" })
+        const before = yield* Deferred.make<void>()
+        const read = yield* Deferred.make<void>()
+        const after = yield* Deferred.make<void>()
+        const release = yield* Deferred.make<void>()
+        const original = MessageV2.stream
+        let held = false
+        // Gate the real read, rather than replacing history or snapshot selection.
+        const spy = spyOn(MessageV2, "stream").mockImplementation((sessionID) =>
+          Effect.gen(function* () {
+            if (held || sessionID !== chat.id) return yield* original(sessionID)
+            held = true
+            yield* Deferred.succeed(before, undefined)
+            yield* Deferred.await(read)
+            const messages = yield* original(sessionID)
+            yield* Deferred.succeed(after, undefined)
+            yield* Deferred.await(release)
+            return messages
+          }),
+        )
+        const first = {
+          sessionID: chat.id,
+          messageID: MessageID.ascending(),
+          model: ref,
+          tools: { read: true },
+          parts: [{ type: "text" as const, text: "withdraw selected input" }],
+        }
+        const a = yield* enqueue(first)
+        yield* Effect.addFinalizer(() =>
+          Effect.gen(function* () {
+            spy.mockRestore()
+            yield* Deferred.succeed(read, undefined)
+            yield* Deferred.succeed(release, undefined)
+          }),
+        )
+        yield* awaitWithTimeout(Deferred.await(before), "snapshot read did not start")
+        const second = {
+          ...first,
+          messageID: MessageID.ascending(),
+          tools: { read: false },
+          parts: [{ type: "text" as const, text: "late admission" }],
+        }
+        const b = yield* enqueue(second)
+        yield* visible(second.messageID)
+        yield* Deferred.succeed(read, undefined)
+        yield* awaitWithTimeout(Deferred.await(after), "snapshot read did not finish")
+        if (remove) expect(yield* prompt.withdraw(chat.id, "during-read")).toEqual([first, second])
+        if (!remove) yield* llm.push(reply().text("first response").stop(), reply().text("second response").stop())
+        yield* Deferred.succeed(release, undefined)
+        const result = yield* Fiber.join(a)
+        yield* Fiber.join(b)
+        if (remove) {
+          expect(result.info.id).toBe(previous.assistant.id)
+          expect(yield* llm.calls).toBe(0)
+          expect(
+            (yield* sessions.messages({ sessionID: chat.id })).some(
+              (message) => message.info.id === first.messageID || message.info.id === second.messageID,
+            ),
+          ).toBe(false)
+        }
+        if (!remove) {
+          expect(yield* llm.calls).toBe(2)
+          expect(JSON.stringify((yield* llm.inputs)[0])).not.toContain("late admission")
+          expect(JSON.stringify((yield* llm.inputs)[1])).toContain("late admission")
+          expect(JSON.stringify((yield* llm.inputs)[0].tools)).toContain('"name":"read"')
+          expect(JSON.stringify((yield* llm.inputs)[1].tools)).not.toContain('"name":"read"')
+        }
+      }),
+  )
+
+noLLMServer.instance(
+  "failed unpersisted preparation can retry the same message ID",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Pinned" })
+      const input = {
+        sessionID: chat.id,
+        messageID: MessageID.ascending(),
+        model: ref,
+        parts: [{ type: "text" as const, text: "retry after correcting the agent" }],
+      }
+      expect(Exit.isFailure(yield* prompt.prompt({ ...input, agent: "missing-agent" }).pipe(Effect.exit))).toBe(true)
+      expect(yield* sessions.messages({ sessionID: chat.id })).toEqual([])
+      expect((yield* prompt.prompt({ ...input, agent: "build", noReply: true })).info.id).toBe(input.messageID)
+      expect(yield* prompt.withdraw(chat.id, "failed")).toEqual([])
+    }),
+  { config: cfg },
+)
+
+it.instance("withdrawal receipts survive partial removal failure without exposing the batch to the model", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const events = yield* EventV2Bridge.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+    const release = yield* Deferred.make<void>()
+    yield* llm.push(reply().wait(deferredAsPromise(release)).text("active result").stop())
+    const active = yield* enqueue({ sessionID: chat.id, model: ref, parts: [{ type: "text", text: "active" }] })
+    yield* llm.wait(1)
+    const inputs = ["first pending", "second pending"].map((text) => ({
+      sessionID: chat.id,
+      messageID: MessageID.ascending(),
+      model: ref,
+      parts: [{ type: "text" as const, text }],
+    }))
+    const pending = []
+    for (const input of inputs) {
+      pending.push(yield* enqueue(input))
+      yield* visible(input.messageID)
+    }
+    let fail = true
+    yield* events.project(SessionV1.Event.MessageRemoved, (event) =>
+      Effect.gen(function* () {
+        if (event.data.messageID !== inputs[1].messageID || !fail) return
+        fail = false
+        return yield* Effect.die("simulated removal failure")
+      }),
+    )
+    expect(Exit.isFailure(yield* prompt.withdraw(chat.id, "retry-removal").pipe(Effect.exit))).toBe(true)
+    yield* Deferred.succeed(release, undefined)
+    yield* Fiber.join(active)
+    yield* Effect.forEach(pending, Fiber.join)
+    expect(yield* llm.calls).toBe(1)
+    expect(yield* prompt.withdraw(chat.id, "retry-removal")).toEqual(inputs)
+    expect(yield* prompt.withdraw(chat.id, "retry-removal")).toEqual(inputs)
+    expect(
+      (yield* sessions.messages({ sessionID: chat.id })).some((message) =>
+        inputs.some((input) => input.messageID === message.info.id),
+      ),
+    ).toBe(false)
+  }),
+)
+
+it.instance("cancelled hung preparation does not block a subsequent submission", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const plugin = yield* Plugin.Service
+    const hooks = yield* plugin.list()
+    const id = MessageID.ascending()
+    const started = defer<void>()
+    const release = defer<void>()
+    const hook = {
+      "chat.message": async (input: { messageID?: string }) => {
+        if (input.messageID !== id) return
+        started.resolve()
+        await release.promise
+      },
+    }
+    hooks.push(hook)
+    const chat = yield* sessions.create({ title: "Pinned" })
+    const input = {
+      sessionID: chat.id,
+      messageID: id,
+      model: ref,
+      parts: [{ type: "text" as const, text: "hung input" }],
+    }
+    const hung = yield* enqueue(input)
+    yield* Effect.addFinalizer(() =>
+      Effect.sync(() => {
+        release.resolve()
+        hooks.splice(hooks.indexOf(hook), 1)
+      }),
+    )
+    yield* awaitWithTimeout(
+      Effect.promise(() => started.promise),
+      "preparation did not start",
+    )
+    yield* prompt.cancel(chat.id)
+    yield* llm.text("new request completed")
+    const result = yield* awaitWithTimeout(
+      prompt.prompt({ sessionID: chat.id, model: ref, parts: [{ type: "text", text: "new request" }] }),
+      "cancelled preparation blocked the next request",
+    )
+    expect(result.info.role).toBe("assistant")
+    expect(JSON.stringify(yield* llm.inputs)).not.toContain("hung input")
+    expect(yield* prompt.withdraw(chat.id, "cancelled")).toEqual([input])
+    release.resolve()
+    yield* Fiber.join(hung)
+    expect(yield* llm.calls).toBe(1)
+  }),
+)
+
+noLLMServer.instance(
+  "session deletion discards receipts and suppresses late preparation errors",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const plugin = yield* Plugin.Service
+      const events = yield* EventV2Bridge.Service
+      const hooks = yield* plugin.list()
+      const chat = yield* sessions.create({ title: "Pinned" })
+      const started = defer<void>()
+      const release = defer<void>()
+      const hook = {
+        "chat.message": async (input: { sessionID: string }) => {
+          if (input.sessionID !== chat.id) return
+          started.resolve()
+          await release.promise
+          throw new Error("late plugin failure")
+        },
+      }
+      hooks.push(hook)
+      const input = {
+        sessionID: chat.id,
+        messageID: MessageID.ascending(),
+        model: ref,
+        parts: [{ type: "text" as const, text: "deleted session input" }],
+      }
+      const fiber = yield* enqueue(input)
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          release.resolve()
+          hooks.splice(hooks.indexOf(hook), 1)
+        }),
+      )
+      yield* awaitWithTimeout(
+        Effect.promise(() => started.promise),
+        "preparation did not start",
+      )
+      expect(yield* prompt.withdraw(chat.id, "receipt")).toEqual([input])
+      yield* sessions.remove(chat.id)
+      expect(yield* prompt.withdraw(chat.id, "receipt")).toEqual([])
+      const errors: unknown[] = []
+      yield* events.listen((event) =>
+        Effect.sync(() => {
+          if (event.type === Session.Event.Error.type) errors.push(event.data)
+        }),
+      )
+      const next = yield* sessions.create({ title: "Next" })
+      yield* prompt.prompt({ ...input, sessionID: next.id, noReply: true })
+      release.resolve()
+      const exit = yield* Fiber.await(fiber)
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isFailure(exit)) expect(Cause.squash(exit.cause)).toBeInstanceOf(SessionPrompt.PromptAbandonedError)
+      expect(errors).toEqual([])
+    }),
+  { config: cfg },
+)
+
+noLLMServer.instance(
+  "session deletion retains an in-flight publisher's ID until it settles",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const events = yield* EventV2Bridge.Service
+      const chat = yield* sessions.create({ title: "Deleted" })
+      const next = yield* sessions.create({ title: "Next" })
+      const input = {
+        messageID: MessageID.ascending(),
+        model: ref,
+        parts: [{ type: "text" as const, text: "old publication" }],
+      }
+      let conflict: unknown
+      yield* events.listen((event) =>
+        Effect.gen(function* () {
+          if (event.type !== SessionV1.Event.MessageUpdated.type) return
+          const data = event.data as typeof SessionV1.Event.MessageUpdated.data.Type
+          if (data.info.sessionID !== chat.id) return
+          yield* sessions.remove(chat.id).pipe(Effect.orDie)
+          const exit = yield* prompt.prompt({ ...input, sessionID: next.id, noReply: true }).pipe(Effect.exit)
+          conflict = Exit.isFailure(exit) ? Cause.squash(exit.cause) : undefined
+        }),
+      )
+      yield* prompt.prompt({ ...input, sessionID: chat.id })
+      expect(conflict).toBeInstanceOf(SessionPrompt.PromptConflictError)
+      const result = yield* prompt.prompt({ ...input, sessionID: next.id, noReply: true })
+      expect(result.info.sessionID).toBe(next.id)
+      expect(yield* sessions.messages({ sessionID: next.id })).toHaveLength(1)
+    }),
+  { config: cfg },
+)
 
 const deferredAsPromise = <A>(deferred: Deferred.Deferred<A>): PromiseLike<A> => ({
   then: (onfulfilled, onrejected) => {
@@ -1454,24 +2754,15 @@ it.instance("prompt submitted during an active run is included in the next LLM i
     yield* waitForBusy(chat.id)
 
     const id = MessageID.ascending()
-    const b = yield* prompt
-      .prompt({
-        sessionID: chat.id,
-        messageID: id,
-        agent: "build",
-        model: ref,
-        parts: [{ type: "text", text: "second" }],
-      })
-      .pipe(Effect.forkChild)
-
-    yield* pollWithTimeout(
-      sessions
-        .messages({ sessionID: chat.id })
-        .pipe(
-          Effect.map((msgs) => (msgs.some((msg) => msg.info.role === "user" && msg.info.id === id) ? true : undefined)),
-        ),
-      "timed out waiting for second prompt to save",
-    )
+    const b = yield* enqueue({
+      sessionID: chat.id,
+      messageID: id,
+      agent: "build",
+      model: ref,
+      parts: [{ type: "text", text: "second" }],
+    })
+    yield* visible(id)
+    expect((yield* sessions.messages({ sessionID: chat.id })).some((message) => message.info.id === id)).toBe(true)
 
     yield* Deferred.succeed(gate, void 0)
 

@@ -361,6 +361,7 @@ export const {
         case "message.removed": {
           touchMessage(event.properties.sessionID, event.properties.messageID)
           const messages = store.message[event.properties.sessionID]
+          if (!messages) break
           const index = messages.findIndex((message) => message.id === event.properties.messageID)
           if (index !== -1) {
             setStore(

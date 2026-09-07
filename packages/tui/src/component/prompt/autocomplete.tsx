@@ -702,6 +702,14 @@ export function Autocomplete(props: {
         // Check for "@" trigger - find the nearest "@" before cursor with no whitespace between
         const idx = mentionTriggerIndex(value, offset)
         if (idx !== undefined) {
+          // Restored attachment/agent markers are already completed mentions.
+          if (
+            props
+              .input()
+              .extmarks.getAllForTypeId(props.promptPartTypeId())
+              .some((mark) => mark.start <= idx && idx < mark.end)
+          )
+            return
           show("@")
           setStore("index", idx)
         }

@@ -9,6 +9,7 @@ import { Session } from "@/session/session"
 import { SessionCompaction } from "@/session/compaction"
 import { MessageV2 } from "@/session/message-v2"
 import { SessionPrompt } from "@/session/prompt"
+import type { Image } from "@/image/image"
 import { SessionRevert } from "@/session/revert"
 import { SessionRunState } from "@/session/run-state"
 import { SessionStatus } from "@/session/status"
@@ -16,7 +17,7 @@ import { SessionSummary } from "@/session/summary"
 import { Todo } from "@/session/todo"
 import { MessageID, PartID, SessionID } from "@/session/schema"
 import { NamedError } from "@opencode-ai/core/util/error"
-import { Cause, Effect, Option, Schema, Scope } from "effect"
+import { Cause, Deferred, Effect, Option, Schema, Scope } from "effect"
 import * as Stream from "effect/Stream"
 import { InstanceState } from "@/effect/instance-state"
 import { HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
@@ -308,12 +309,25 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       })
     })
 
+    const withdraw = Effect.fn("SessionHttpApi.withdraw")(function* (ctx: {
+      params: { sessionID: SessionID }
+      payload: { requestID: string }
+    }) {
+      yield* requireSession(ctx.params.sessionID)
+      return yield* promptSvc.withdraw(ctx.params.sessionID, ctx.payload.requestID)
+    })
+
     const promptAsync = Effect.fn("SessionHttpApi.promptAsync")(function* (ctx: {
       params: { sessionID: SessionID }
       payload: typeof PromptPayload.Type
     }) {
       yield* requireSession(ctx.params.sessionID)
-      yield* promptSvc.prompt({ ...ctx.payload, sessionID: ctx.params.sessionID }).pipe(
+      const admitted = yield* Deferred.make<
+        void,
+        Image.Error | SessionPrompt.PromptConflictError | SessionPrompt.PromptAbandonedError
+      >()
+      yield* promptSvc.prompt({ ...ctx.payload, sessionID: ctx.params.sessionID }, { admitted }).pipe(
+        Effect.catchTag("PromptAbandonedError", () => Effect.void),
         Effect.catchCause((cause) =>
           Effect.gen(function* () {
             yield* Effect.logError("prompt_async failed", { sessionID: ctx.params.sessionID, cause })
@@ -325,6 +339,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
         ),
         Effect.forkIn(scope, { startImmediately: true }),
       )
+      yield* Deferred.await(admitted).pipe(Effect.mapError(() => new HttpApiError.BadRequest({})))
       return HttpApiSchema.NoContent.make()
     })
 
@@ -430,6 +445,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       .handle("summarize", summarize)
       .handle("prompt", prompt)
       .handle("promptAsync", promptAsync)
+      .handle("withdraw", withdraw)
       .handle("command", command)
       .handle("shell", shell)
       .handle("revert", revert)

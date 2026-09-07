@@ -7,6 +7,7 @@ import {
   Info,
   LeaderTimeoutDefault,
   PluginSpec,
+  Prompt,
   resolve,
   TuiConfigProvider,
   type Info as TuiConfigInfo,
@@ -64,6 +65,27 @@ test("resolves host-neutral defaults", () => {
   expect(config.keybinds.has("terminal.suspend")).toBe(true)
   expect(config.keybinds.has("session.list")).toBe(true)
   expect(config.cursor).toBeUndefined()
+  expect(config.prompt).toBeUndefined()
+})
+
+test("queue editing is optional and only accepts booleans", () => {
+  expect(resolve(decodeInfo({ prompt: {} }), { terminalSuspend: true }).prompt).toEqual({})
+  for (const queue_edit of [true, false]) {
+    const config = resolve(decodeInfo({ prompt: { queue_edit, max_height: 10 } }), { terminalSuspend: true })
+    expect(config.prompt).toEqual({ queue_edit, max_height: 10 })
+  }
+  for (const queue_edit of ["true", "false", 0, 1, null, [], {}]) {
+    expect(() => decodeInfo({ prompt: { queue_edit } })).toThrow()
+  }
+  expect(Schema.toJsonSchemaDocument(Prompt).schema).toMatchObject({
+    type: "object",
+    properties: {
+      queue_edit: {
+        anyOf: [{ type: "boolean" }, { type: "null" }],
+        description: "Use previous-history key on empty input to withdraw queued prompts for editing",
+      },
+    },
+  })
 })
 
 test("resolves overrides without mutating input", () => {

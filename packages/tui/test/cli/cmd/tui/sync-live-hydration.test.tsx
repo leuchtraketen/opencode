@@ -246,39 +246,73 @@ test("live messages merged during hydration retain the 100 message window", asyn
   }
 })
 
-test("a message removed during hydration does not regain stale parts", async () => {
+test.each([false, true])(
+  "removal during hydration excludes stale parts (previously published: %s)",
+  async (published) => {
+    await using tmp = await tmpdir()
+    await Bun.write(`${tmp.path}/kv.json`, "{}")
+
+    let resolveMessages!: (response: Response) => void
+    const messages = new Promise<Response>((resolve) => {
+      resolveMessages = resolve
+    })
+    let requested = false
+    const { app, emit, sync } = await mount((url) => {
+      if (url.pathname === `/session/${sessionID}`) return json(session)
+      if (url.pathname === `/session/${sessionID}/message`) {
+        requested = true
+        return messages
+      }
+      if (url.pathname === `/session/${sessionID}/todo` || url.pathname === `/session/${sessionID}/diff`)
+        return json([])
+      return undefined
+    }, tmp.path)
+
+    try {
+      if (published) {
+        emit(global({ id: "evt_message", type: "message.updated", properties: { sessionID, info: assistant } }))
+        await wait(() => sync.data.message[sessionID]?.length === 1)
+      }
+      const hydrate = sync.session.sync(sessionID)
+      await wait(() => requested)
+      emit(global({ id: "evt_removed", type: "message.removed", properties: { sessionID, messageID } }))
+      emit(global({ id: "evt_busy", type: "session.status", properties: { sessionID, status: { type: "busy" } } }))
+      await wait(() => sync.data.session_status[sessionID]?.type === "busy")
+      resolveMessages(
+        json([{ info: assistant, parts: [{ id: partID, sessionID, messageID, type: "text", text: "stale" }] }]),
+      )
+      await hydrate
+
+      expect(sync.data.message[sessionID]).toEqual([])
+      expect(sync.data.part[messageID]).toBeUndefined()
+    } finally {
+      app.renderer.destroy()
+    }
+  },
+)
+
+test("withdrawal removal for an unknown session does not break subsequent events", async () => {
   await using tmp = await tmpdir()
   await Bun.write(`${tmp.path}/kv.json`, "{}")
-
-  let resolveMessages!: (response: Response) => void
-  const messages = new Promise<Response>((resolve) => {
-    resolveMessages = resolve
-  })
-  let requested = false
-  const { app, emit, sync } = await mount((url) => {
-    if (url.pathname === `/session/${sessionID}`) return json(session)
-    if (url.pathname === `/session/${sessionID}/message`) {
-      requested = true
-      return messages
-    }
-    if (url.pathname === `/session/${sessionID}/todo` || url.pathname === `/session/${sessionID}/diff`) return json([])
-    return undefined
-  }, tmp.path)
-
+  const { app, emit, sync } = await mount(undefined, tmp.path)
   try {
-    emit(global({ id: "evt_message", type: "message.updated", properties: { sessionID, info: assistant } }))
+    expect(sync.data.message[sessionID]).toBeUndefined()
+    expect(() =>
+      emit(global({ id: "evt_unpublished_removed", type: "message.removed", properties: { sessionID, messageID } })),
+    ).not.toThrow()
+    emit(global({ id: "evt_following_message", type: "message.updated", properties: { sessionID, info: assistant } }))
     await wait(() => sync.data.message[sessionID]?.length === 1)
-    const hydrate = sync.session.sync(sessionID)
-    await wait(() => requested)
-    emit(global({ id: "evt_removed", type: "message.removed", properties: { sessionID, messageID } }))
-    await wait(() => sync.data.message[sessionID]?.length === 0)
-    resolveMessages(
-      json([{ info: assistant, parts: [{ id: partID, sessionID, messageID, type: "text", text: "stale" }] }]),
+    expect(sync.data.message[sessionID][0].id).toBe(messageID)
+    emit(
+      global({
+        id: "evt_unknown_removed",
+        type: "message.removed",
+        properties: { sessionID, messageID: "msg_unknown" },
+      }),
     )
-    await hydrate
-
-    expect(sync.data.message[sessionID]).toEqual([])
-    expect(sync.data.part[messageID]).toBeUndefined()
+    emit(global({ id: "evt_idle", type: "session.status", properties: { sessionID, status: { type: "idle" } } }))
+    await wait(() => sync.data.session_status[sessionID]?.type === "idle")
+    expect(sync.data.message[sessionID]).toHaveLength(1)
   } finally {
     app.renderer.destroy()
   }

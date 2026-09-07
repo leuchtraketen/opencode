@@ -32,7 +32,8 @@ import { promptOffsetWidth } from "../../prompt/display"
 import { createStore, produce, unwrap } from "solid-js/store"
 import { usePromptHistory, type PromptInfo } from "../../prompt/history"
 import { computePromptTraits } from "../../prompt/traits"
-import { expandPastedTextPlaceholders, expandTrackedPastedText } from "../../prompt/part"
+import { expandPastedTextPlaceholders } from "../../prompt/part"
+import { promptParts } from "../../prompt/queue"
 import { usePromptStash } from "../../prompt/stash"
 import { DialogStash } from "../dialog-stash"
 import { type AutocompleteRef, Autocomplete } from "./autocomplete"
@@ -232,6 +233,9 @@ export function Prompt(props: PromptProps) {
   const agentStyleId = syntax().getStyleId("extmark.agent")!
   const pasteStyleId = syntax().getStyleId("extmark.paste")!
   let promptPartTypeId = 0
+  let promptRevision = 0
+  let withdrawalRevision = 0
+  let disposed = false
   const event = useEvent()
 
   event.on("tui.prompt.append", (evt, { workspace }) => {
@@ -302,6 +306,7 @@ export function Prompt(props: PromptProps) {
     on(
       () => props.sessionID,
       () => {
+        promptRevision++
         setStore("placeholder", randomIndex(list().length))
       },
       { defer: true },
@@ -625,6 +630,7 @@ export function Prompt(props: PromptProps) {
   })
 
   onCleanup(() => {
+    disposed = true
     if (store.prompt.input) {
       stashed = { prompt: unwrap(store.prompt), cursor: input.cursorOffset }
     }
@@ -705,26 +711,20 @@ export function Prompt(props: PromptProps) {
       produce((draft) => {
         const newMap = new Map<number, number>()
         const newParts: typeof draft.prompt.parts = []
-
-        for (const extmark of allExtmarks) {
-          const partIndex = draft.extmarkToPartIndex.get(extmark.id)
-          if (partIndex !== undefined) {
-            const part = draft.prompt.parts[partIndex]
-            if (part) {
-              if (part.type === "agent" && part.source) {
-                part.source.start = extmark.start
-                part.source.end = extmark.end
-              } else if (part.type === "file" && part.source?.text) {
-                part.source.text.start = extmark.start
-                part.source.text.end = extmark.end
-              } else if (part.type === "text" && part.source?.text) {
-                part.source.text.start = extmark.start
-                part.source.text.end = extmark.end
-              }
-              newMap.set(extmark.id, newParts.length)
-              newParts.push(part)
-            }
+        const marks = new Map(allExtmarks.map((mark) => [draft.extmarkToPartIndex.get(mark.id), mark]))
+        for (const [index, part] of draft.prompt.parts.entries()) {
+          const extmark = marks.get(index)
+          if (!extmark) {
+            if (!part.source) newParts.push(part)
+            continue
           }
+          const source = part.type === "agent" ? part.source : part.source?.text
+          if (source) {
+            source.start = extmark.start
+            source.end = extmark.end
+          }
+          newMap.set(extmark.id, newParts.length)
+          newParts.push(part)
         }
 
         draft.extmarkToPartIndex = newMap
@@ -872,18 +872,61 @@ export function Prompt(props: PromptProps) {
           title: "Previous prompt history",
           category: "Prompt",
           run() {
+            if (props.sessionID && sdk.prompts.busy(props.sessionID)) return
             if (input.cursorOffset !== 0) {
               if (input.scrollY + input.visualCursor.visualRow === 0) input.cursorOffset = 0
               return false
             }
 
-            const item = history.move(-1, input.plainText)
-            if (!item) return false
-            input.setText(item.input)
-            setStore("prompt", item)
-            setStore("mode", item.mode ?? "normal")
-            restoreExtmarksFromParts(item.parts)
-            input.cursorOffset = 0
+            const previous = () => {
+              const item = history.move(-1, input.plainText)
+              if (!item) return false
+              ref.set(item)
+              setStore("mode", item.mode ?? "normal")
+              input.cursorOffset = 0
+            }
+            if (
+              tuiConfig.prompt?.queue_edit !== true ||
+              store.mode !== "normal" ||
+              input.plainText ||
+              store.prompt.parts.length ||
+              !props.sessionID
+            )
+              return previous()
+
+            const sessionID = props.sessionID
+            const revision = promptRevision
+            withdrawalRevision++
+            void sdk.prompts
+              .withdraw(sessionID, {
+                current: () =>
+                  !disposed &&
+                  !input.isDestroyed &&
+                  props.sessionID === sessionID &&
+                  promptRevision === revision &&
+                  store.mode === "normal" &&
+                  !input.plainText &&
+                  !store.prompt.parts.length,
+                restore: (prompt) => {
+                  ref.set(prompt)
+                  setStore("mode", "normal")
+                },
+                save: (prompt) => {
+                  stash.push(prompt)
+                  toast.show({
+                    message: "Withdrawn prompts saved in the prompt stash; your current draft was left unchanged.",
+                    variant: "info",
+                  })
+                },
+                empty: previous,
+              })
+              .catch((error) => {
+                toast.show({
+                  title: "Failed to withdraw queued prompts",
+                  message: errorMessage(error),
+                  variant: "error",
+                })
+              })
           },
         },
       ],
@@ -935,7 +978,7 @@ export function Prompt(props: PromptProps) {
     // clears `store.prompt.input`, then awaits its own `session.create` and
     // ultimately reads the now-empty store — sending a phantom empty prompt
     // to a freshly created session.
-    if (submitting) return false
+    if (disposed || submitting || (props.sessionID && sdk.prompts.busy(props.sessionID))) return false
     submitting = true
     try {
       return await submitInner()
@@ -1023,18 +1066,9 @@ export function Prompt(props: PromptProps) {
       sessionID = res.data.id
     }
 
-    const inputText = expandTrackedPastedText(
-      store.prompt.input,
-      input.extmarks.getAllForTypeId(promptPartTypeId).flatMap((extmark) => {
-        const partIndex = store.extmarkToPartIndex.get(extmark.id)
-        const part = partIndex === undefined ? undefined : store.prompt.parts[partIndex]
-        if (part?.type !== "text") return []
-        return [{ start: extmark.start, end: extmark.end, text: part.text }]
-      }),
-    )
-
-    // Filter out text parts (pasted content) since they're now expanded inline
-    const nonTextParts = store.prompt.parts.filter((part) => part.type !== "text")
+    const parts = promptParts(structuredClone(unwrap(store.prompt)))
+    const inputText = parts[0].type === "text" ? parts[0].text : ""
+    const nonTextParts = parts.filter((part) => part.type !== "text")
 
     // Capture mode before it gets reset
     const currentMode = store.mode
@@ -1091,32 +1125,25 @@ export function Prompt(props: PromptProps) {
       })
     } else {
       move.startSubmit()
-      sdk.client.session
-        .prompt(
-          {
-            sessionID,
-            ...selectedModel,
-            agent: agent.name,
-            model: selectedModel,
-            variant,
-            parts: [
-              ...editorParts,
-              {
-                type: "text",
-                text: inputText,
-              },
-              ...nonTextParts,
-            ],
-          },
-          { throwOnError: true },
-        )
-        .catch((error) => {
-          toast.show({
-            title: "Failed to send prompt",
-            message: errorMessage(error),
-            variant: "error",
-          })
+      const payload = {
+        sessionID,
+        ...selectedModel,
+        agent: agent.name,
+        model: selectedModel,
+        variant,
+        parts: [...editorParts, ...parts],
+      }
+      const request =
+        tuiConfig.prompt?.queue_edit === true
+          ? sdk.prompts.submit(payload)
+          : sdk.client.session.prompt(payload, { throwOnError: true })
+      request.catch((error) => {
+        toast.show({
+          title: "Failed to send prompt",
+          message: errorMessage(error),
+          variant: "error",
         })
+      })
       if (editorParts.length > 0) editor.markSelectionSent()
     }
     history.append({
@@ -1375,6 +1402,7 @@ export function Prompt(props: PromptProps) {
               minHeight={1}
               maxHeight={maxHeight()}
               onContentChange={() => {
+                promptRevision++
                 const value = input.plainText
                 setStore("prompt", "input", value)
                 auto()?.onInput(value)
@@ -1389,9 +1417,19 @@ export function Prompt(props: PromptProps) {
                 }
               }}
               onSubmit={() => {
+                if (props.sessionID && sdk.prompts.busy(props.sessionID)) return
+                const sessionID = props.sessionID
+                const revision = withdrawalRevision
                 // IME: double-defer so the last composed character (e.g. Korean
                 // hangul) is flushed to plainText before we read it for submission.
-                setTimeout(() => setTimeout(() => submit(), 0), 0)
+                setTimeout(
+                  () =>
+                    setTimeout(() => {
+                      if (sessionID !== props.sessionID || revision !== withdrawalRevision) return
+                      void submit()
+                    }, 0),
+                  0,
+                )
               }}
               onPaste={async (event: PasteEvent) => {
                 if (props.disabled) {

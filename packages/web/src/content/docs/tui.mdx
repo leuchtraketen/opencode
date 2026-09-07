@@ -402,8 +402,32 @@ This is separate from `opencode.json`, which configures server/runtime behavior.
 - `cursor` - Controls the terminal cursor in TUI input fields. `style` defaults to `"block"`, can be `"underline"`, `"line"`, or `"default"`; `blinking` defaults to `true`. When `style` is `"default"`, the terminal default cursor is restored, so `blinking` has no effect.
 - `mouse` - Enable or disable mouse capture in the TUI (default: `true`). When disabled, the terminal's native mouse selection/scrolling behavior is preserved.
 - `attention` - Configures TUI desktop notifications and sounds. Disabled by default.
+- `prompt.queue_edit` - Enables queued prompt editing with the previous-history key. Defaults to `false`.
 
 Use `OPENCODE_TUI_CONFIG` to load a custom TUI config path.
+
+### Queued prompt editing
+
+Opt in to editing prompts that have not yet been consumed by the active session:
+
+```json title="tui.json"
+{
+  "$schema": "https://opencode.ai/tui.json",
+  "prompt": {
+    "queue_edit": true
+  }
+}
+```
+
+With an empty normal-mode input, press the previous-history key (`Up` by default) to withdraw all unconsumed prompts into one editable draft, in admission order, preserving attachments. The active turn continues uninterrupted. Press `Enter` to send the edited draft as one prompt.
+
+Prepared queued prompts can already be visible in the transcript; visibility does not mean the active turn has consumed them. Withdrawal removes those queued messages from the transcript while restoring their original text and attachments to the draft.
+
+History is recalled only when no prompts are pending. A withdrawal error leaves history untouched. If you type, change sessions, or close the prompt while withdrawal is in progress, returned prompts are saved in the prompt stash instead of replacing your current draft.
+
+After an error, press the previous-history key again on an empty input to retry the same withdrawal. This recovers a lost response without withdrawing a newer batch. If that replay is empty, press again to check the current queue before recalling history.
+
+This setting is disabled by default and only changes interactive TUI prompt editing. It does not change `opencode run`, shell mode, or command execution. The queue and retry receipts belong to the active server instance and are not recovered after a server restart.
 
 ### Attention
 

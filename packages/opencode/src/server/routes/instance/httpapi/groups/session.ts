@@ -94,6 +94,7 @@ export const SessionPaths = {
   summarize: `${root}/:sessionID/summarize`,
   prompt: `${root}/:sessionID/message`,
   promptAsync: `${root}/:sessionID/prompt_async`,
+  withdraw: `${root}/:sessionID/queue/withdraw`,
   command: `${root}/:sessionID/command`,
   shell: `${root}/:sessionID/shell`,
   revert: `${root}/:sessionID/revert`,
@@ -326,6 +327,20 @@ export const SessionApi = HttpApi.make("session")
             description: "Create and send a new message to a session, streaming the AI response.",
           }),
         ),
+        HttpApiEndpoint.post("withdraw", SessionPaths.withdraw, {
+          params: { sessionID: SessionID },
+          query: WorkspaceRoutingQuery,
+          payload: Schema.Struct({ requestID: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(128)) }),
+          success: described(Schema.Array(SessionPrompt.PromptInput), "Original unconsumed prompts in admission order"),
+          error: [HttpApiError.BadRequest, ApiNotFoundError],
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "session.withdraw",
+            summary: "Withdraw queued prompts",
+            description:
+              "Withdraw all unconsumed user prompts without interrupting active work. Returns original payloads in admission order, including attachments. Use a unique requestID per action and reuse it to retry a lost response within the same active server instance. Excludes noReply, synthetic, and task-owned inputs. Queue and receipts are not persisted.",
+          }),
+        ),
         HttpApiEndpoint.post("promptAsync", SessionPaths.promptAsync, {
           params: { sessionID: SessionID },
           query: WorkspaceRoutingQuery,
@@ -337,7 +352,7 @@ export const SessionApi = HttpApi.make("session")
             identifier: "session.prompt_async",
             summary: "Send async message",
             description:
-              "Create and send a new message to a session asynchronously, starting the session if needed and returning immediately.",
+              "Admit a prompt before returning, then prepare and process it asynchronously. Admission errors fail the request; later preparation or execution errors are reported as session.error events.",
           }),
         ),
         HttpApiEndpoint.post("command", SessionPaths.command, {

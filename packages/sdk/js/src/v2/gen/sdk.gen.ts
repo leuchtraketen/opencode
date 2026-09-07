@@ -223,6 +223,8 @@ import type {
   SessionUnshareResponses,
   SessionUpdateErrors,
   SessionUpdateResponses,
+  SessionWithdrawErrors,
+  SessionWithdrawResponses,
   SubtaskPartInput,
   SyncHistoryListErrors,
   SyncHistoryListResponses,
@@ -4088,9 +4090,48 @@ export class Session2 extends HeyApiClient {
   }
 
   /**
+   * Withdraw queued prompts
+   *
+   * Withdraw all unconsumed user prompts without interrupting active work. Returns original payloads in admission order, including attachments. Use a unique requestID per action and reuse it to retry a lost response within the same active server instance. Excludes noReply, synthetic, and task-owned inputs. Queue and receipts are not persisted.
+   */
+  public withdraw<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      directory?: string
+      workspace?: string
+      requestID?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { in: "body", key: "requestID" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<SessionWithdrawResponses, SessionWithdrawErrors, ThrowOnError>({
+      url: "/session/{sessionID}/queue/withdraw",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
    * Send async message
    *
-   * Create and send a new message to a session asynchronously, starting the session if needed and returning immediately.
+   * Admit a prompt before returning, then prepare and process it asynchronously. Admission errors fail the request; later preparation or execution errors are reported as session.error events.
    */
   public promptAsync<ThrowOnError extends boolean = false>(
     parameters: {
