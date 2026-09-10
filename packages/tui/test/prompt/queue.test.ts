@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { createOpencodeClient, type SessionPromptPromptInput } from "@opencode-ai/sdk/v2"
-import { combineQueuedPrompts, createPromptQueue, promptParts } from "../../src/prompt/queue"
+import { combineQueuedPrompts, createPromptQueue, promptParts, trimPromptTail } from "../../src/prompt/queue"
 import { displaySlice, promptOffsetWidth } from "../../src/prompt/display"
 import type { PromptInfo } from "../../src/prompt/history"
 
@@ -130,6 +130,35 @@ describe("queued prompt conversion", () => {
     expect(draft.parts[0]).toEqual(hidden)
     expect(promptParts(draft).slice(1)).toEqual(draft.parts)
     expect(promptOffsetWidth(draft.input)).toBe(16)
+  })
+
+  test("submission drops the withdrawal's trailing padding without disturbing attachments", () => {
+    const draft = combineQueuedPrompts([prompt("first"), prompt("second")])
+    const padded: PromptInfo = { ...draft, input: `${draft.input}\n\n` }
+    expect(trimPromptTail(padded).input).toBe("first\n\nsecond")
+    // An untouched draft must be returned as-is, not needlessly copied.
+    expect(trimPromptTail(draft)).toBe(draft)
+    // Deliberate trailing blank lines the user typed are padding too: the wire
+    // prompt should never carry them.
+    expect(trimPromptTail({ ...draft, input: "text\n   \n\t" }).input).toBe("text")
+    expect(trimPromptTail({ input: "   ", parts: [], mode: "normal" }).input).toBe("")
+  })
+
+  test("trailing whitespace inside an attachment marker is never trimmed", () => {
+    const draft = combineQueuedPrompts([
+      {
+        sessionID: "ses_test",
+        parts: [
+          { type: "text", text: "look " },
+          { type: "file", mime: "image/png", filename: "pic.png", url: "data:image/png;base64,AAA" },
+        ],
+      },
+    ])
+    const marker = draft.parts.find((part) => part.type === "file")!.source!.text
+    // Force the marker to cover the trailing whitespace so trimming would corrupt it.
+    const risky: PromptInfo = { ...draft, input: `${draft.input}\n` }
+    marker.end = promptOffsetWidth(risky.input)
+    expect(trimPromptTail(risky)).toBe(risky)
   })
 })
 

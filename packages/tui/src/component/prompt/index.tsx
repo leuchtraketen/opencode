@@ -33,7 +33,7 @@ import { createStore, produce, unwrap } from "solid-js/store"
 import { usePromptHistory, type PromptInfo } from "../../prompt/history"
 import { computePromptTraits } from "../../prompt/traits"
 import { expandPastedTextPlaceholders } from "../../prompt/part"
-import { promptParts } from "../../prompt/queue"
+import { promptParts, trimPromptTail } from "../../prompt/queue"
 import { usePromptStash } from "../../prompt/stash"
 import { DialogStash } from "../dialog-stash"
 import { type AutocompleteRef, Autocomplete } from "./autocomplete"
@@ -908,8 +908,23 @@ export function Prompt(props: PromptProps) {
                   !input.plainText &&
                   !store.prompt.parts.length,
                 restore: (prompt) => {
-                  ref.set(prompt)
+                  // Withdrawn prompts are a draft to append to, so open a fresh
+                  // trailing line and leave the cursor there rather than glued to
+                  // the end of the last prompt's text. The blank line matches the
+                  // separator between the withdrawn prompts themselves.
+                  ref.set({ ...prompt, input: `${prompt.input}\n\n` })
                   setStore("mode", "normal")
+                  // Restoring can race a focus/remount effect that puts the cursor
+                  // back at the buffer start, so re-assert the end once pending
+                  // updates have flushed. Only correct the start-of-buffer case:
+                  // anything else means the draft moved on and is not ours to touch.
+                  const restored = input.plainText
+                  setTimeout(() => {
+                    if (disposed || !input || input.isDestroyed) return
+                    if (input.cursorOffset !== 0 || input.plainText !== restored) return
+                    input.cursorOffset = input.plainText.length
+                    renderer.requestRender()
+                  }, 0)
                 },
                 save: (prompt) => {
                   stash.push(prompt)
@@ -1066,7 +1081,8 @@ export function Prompt(props: PromptProps) {
       sessionID = res.data.id
     }
 
-    const parts = promptParts(structuredClone(unwrap(store.prompt)))
+    const submitted = trimPromptTail(structuredClone(unwrap(store.prompt)))
+    const parts = promptParts(submitted)
     const inputText = parts[0].type === "text" ? parts[0].text : ""
     const nonTextParts = parts.filter((part) => part.type !== "text")
 
@@ -1146,8 +1162,9 @@ export function Prompt(props: PromptProps) {
       })
       if (editorParts.length > 0) editor.markSelectionSent()
     }
+    // Recall the prompt as it was sent, without the withdrawal's editing padding.
     history.append({
-      ...store.prompt,
+      ...submitted,
       mode: currentMode,
     })
     input.extmarks.clear()
@@ -1299,7 +1316,7 @@ export function Prompt(props: PromptProps) {
   function clearPrompt() {
     if (store.prompt.input.trim().length >= DRAFT_RETENTION_MIN_CHARS || store.prompt.parts.length > 0) {
       history.append({
-        ...store.prompt,
+        ...trimPromptTail(unwrap(store.prompt)),
         mode: store.mode,
       })
     }

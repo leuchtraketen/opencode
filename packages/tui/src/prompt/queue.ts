@@ -27,6 +27,23 @@ export function promptParts(prompt: PromptInfo): SessionPromptPromptInput["parts
   ]
 }
 
+// Withdrawal pads the draft with a trailing blank line so the cursor has somewhere
+// to type. That padding is an editing affordance, not content, so drop it before the
+// prompt goes on the wire. Never cut into an attachment: an extmark that reaches the
+// end of the text means the trailing whitespace is part of its value.
+export function trimPromptTail(prompt: PromptInfo): PromptInfo {
+  const trimmed = prompt.input.replace(/\s+$/, "")
+  if (trimmed === prompt.input) return prompt
+
+  const width = promptOffsetWidth(trimmed)
+  for (const part of prompt.parts) {
+    const source = part.type === "agent" ? part.source : part.source?.text
+    if (source && source.end > width) return prompt
+  }
+
+  return { ...prompt, input: trimmed }
+}
+
 export function combineQueuedPrompts(prompts: SessionPromptPromptInput[]): PromptInfo {
   const result: PromptInfo = { input: "", parts: [], mode: "normal" }
   for (const [index, prompt] of prompts.entries()) {

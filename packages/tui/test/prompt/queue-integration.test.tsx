@@ -214,6 +214,53 @@ const queued: SessionPromptPromptInput[] = [
   { sessionID: "ses_test", parts: [{ type: "text", text: "second" }] },
 ]
 
+test("withdrawal opens a trailing line and leaves the cursor on it", async () => {
+  await using tmp = await tmpdir()
+  const h = await mount(tmp.path)
+  try {
+    h.app.mockInput.pressArrow("up")
+    await wait(() => h.requests.length === 1)
+    h.requests[0].reply(
+      Response.json([
+        { sessionID: "ses_test", parts: [{ type: "text", text: "first message" }] },
+        { sessionID: "ses_test", parts: [{ type: "text", text: "second message" }] },
+      ]),
+    )
+    await wait(() => h.ref.current.input.startsWith("first message"))
+    await wait(() => h.input.cursorOffset === h.input.plainText.length)
+    // Prompts keep their blank-line separator and a blank line is opened below,
+    // so the two prompts sit on rows 0 and 2 and the cursor waits on row 4.
+    expect(h.input.plainText).toBe("first message\n\nsecond message\n\n")
+    expect(h.input.visualCursor.logicalRow).toBe(4)
+    expect(h.input.visualCursor.logicalCol).toBe(0)
+  } finally {
+    h.close()
+  }
+})
+
+test("withdrawn multiline prompts still leave the cursor at the very end", async () => {
+  await using tmp = await tmpdir()
+  const h = await mount(tmp.path)
+  try {
+    const long = Array.from({ length: 30 }, (_, index) => `line ${index}`).join("\n")
+    h.app.mockInput.pressArrow("up")
+    await wait(() => h.requests.length === 1)
+    h.requests[0].reply(
+      Response.json([
+        { sessionID: "ses_test", parts: [{ type: "text", text: long }] },
+        { sessionID: "ses_test", parts: [{ type: "text", text: "second message" }] },
+      ]),
+    )
+    await wait(() => h.ref.current.input.includes("second message"))
+    await wait(() => h.input.cursorOffset === h.input.plainText.length)
+    expect(h.input.plainText).toBe(`${long}\n\nsecond message\n\n`)
+    expect(h.input.visualCursor.logicalRow).toBe(33)
+    expect(h.input.visualCursor.logicalCol).toBe(0)
+  } finally {
+    h.close()
+  }
+})
+
 test.each(["omitted", "empty", "false"])("queue_edit %s preserves history and normal submission", async (setting) => {
   await using tmp = await tmpdir()
   const config: Info = setting === "omitted" ? {} : { prompt: setting === "empty" ? {} : { queue_edit: false } }
@@ -288,7 +335,7 @@ test("enabled withdrawal follows the configured previous-history binding and ign
     h.app.mockInput.pressKey("y", { ctrl: true })
     await wait(() => h.requests.length === 1)
     h.requests[0].reply(Response.json(queued))
-    await wait(() => h.ref.current.input === "first [Image 1]\n\nsecond")
+    await wait(() => h.ref.current.input === "first [Image 1]\n\nsecond\n\n")
   } finally {
     h.close()
   }
@@ -304,7 +351,7 @@ test("empty Up withdraws, real extmarks survive editing, Enter submits once with
     h.app.mockInput.pressArrow("up")
     expect(h.requests[0].path).toBe("/session/ses_test/queue/withdraw")
     h.requests[0].reply(Response.json(queued))
-    await wait(() => h.ref.current.input === "first [Image 1]\n\nsecond")
+    await wait(() => h.ref.current.input === "first [Image 1]\n\nsecond\n\n")
     expect(h.ref.current.parts).toHaveLength(1)
     h.input.cursorOffset = 0
     h.input.insertText("edit ")
@@ -316,6 +363,7 @@ test("empty Up withdraws, real extmarks survive editing, Enter submits once with
     const body = h.requests[1].body!
     const text = body.parts.find((part) => part.type === "text")!
     const file = body.parts.find((part) => part.type === "file")!
+    // The editing affordance must not leak trailing whitespace into the wire prompt.
     expect(text.text).toBe("edit first [Image 1]\n\nsecond")
     expect(displaySlice(text.text, file.source!.text.start, file.source!.text.end)).toBe("[Image 1]")
     expect(body.parts.filter((part) => part.type === "file")).toHaveLength(1)
@@ -323,6 +371,8 @@ test("empty Up withdraws, real extmarks survive editing, Enter submits once with
     await Bun.sleep(20)
     expect(h.requests).toHaveLength(2)
     expect(h.ref.current.input).toBe("")
+    // The padding must not survive into recallable history either.
+    expect(h.history.move(-1, "")?.input).toBe("edit first [Image 1]\n\nsecond")
   } finally {
     h.close()
   }
@@ -450,7 +500,7 @@ test("an earlier deferred Enter cannot automatically resubmit the withdrawn draf
     h.app.mockInput.pressArrow("up")
     await wait(() => h.requests.length === 1)
     h.requests[0].reply(Response.json(queued))
-    await wait(() => h.ref.current.input === "first [Image 1]\n\nsecond")
+    await wait(() => h.ref.current.input === "first [Image 1]\n\nsecond\n\n")
     await Bun.sleep(20)
     expect(h.requests).toHaveLength(1)
   } finally {
@@ -472,7 +522,7 @@ test("Up immediately after Enter waits for admission, but not the active turn", 
     h.requests[0].reply(new Response(null, { status: 204 }))
     await wait(() => h.requests.length === 2)
     h.requests[1].reply(Response.json([{ ...h.requests[0].body!, sessionID: "ses_test" }]))
-    await wait(() => h.ref.current.input === "queued locally")
+    await wait(() => h.ref.current.input === "queued locally\n\n")
     expect(h.requests.map((item) => item.path)).toEqual([
       "/session/ses_test/prompt_async",
       "/session/ses_test/queue/withdraw",
@@ -504,7 +554,7 @@ test("Up replays a committed lost response after remount and leaves a newer admi
     await wait(() => h.requests.length === 3)
     expect(h.requests[2].requestID).toBe(requestID)
     h.requests[2].reply(Response.json(receipt))
-    await wait(() => h.ref.current.input === "first [Image 1]\n\nsecond")
+    await wait(() => h.ref.current.input === "first [Image 1]\n\nsecond\n\n")
     expect(h.ref.current.parts).toHaveLength(1)
 
     h.ref.reset()
@@ -516,7 +566,7 @@ test("Up replays a committed lost response after remount and leaves a newer admi
     await wait(() => h.requests.length === 4)
     expect(h.requests[3].requestID).not.toBe(requestID)
     h.requests[3].reply(Response.json([{ ...h.requests[1].body!, sessionID: "ses_test" }]))
-    await wait(() => h.ref.current.input === "newer admission")
+    await wait(() => h.ref.current.input === "newer admission\n\n")
   } finally {
     h.close()
   }
@@ -545,7 +595,7 @@ test("switching sessions cannot replace another session's retry identity", async
     expect(h.requests[2].path).toBe("/session/ses_test/queue/withdraw")
     expect(h.requests[2].requestID).toBe(firstID)
     h.requests[2].reply(Response.json(queued))
-    await wait(() => h.ref.current.input === "first [Image 1]\n\nsecond")
+    await wait(() => h.ref.current.input === "first [Image 1]\n\nsecond\n\n")
 
     h.ref.reset()
     h.setSession("ses_other")
@@ -555,7 +605,7 @@ test("switching sessions cannot replace another session's retry identity", async
     expect(h.requests[3].path).toBe("/session/ses_other/queue/withdraw")
     expect(h.requests[3].requestID).toBe(otherID)
     h.requests[3].reply(Response.json([{ sessionID: "ses_other", parts: [{ type: "text", text: "other session" }] }]))
-    await wait(() => h.ref.current.input === "other session")
+    await wait(() => h.ref.current.input === "other session\n\n")
   } finally {
     h.close()
   }
