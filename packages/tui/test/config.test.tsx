@@ -23,7 +23,7 @@ test("validates config constraints", () => {
     decodeInfo({
       leader_timeout: 250,
       attention: { volume: 1, sounds: { done: "done.wav" } },
-      prompt: { max_height: 10, max_width: "auto" },
+      prompt: { max_height: 10, max_width: "auto", queue_edit: true },
       scroll_speed: 0.001,
       diff_style: "stacked",
       cursor: { blinking: false },
@@ -31,12 +31,14 @@ test("validates config constraints", () => {
   ).toMatchObject({
     leader_timeout: 250,
     attention: { volume: 1 },
+    prompt: { max_height: 10, max_width: "auto", queue_edit: true },
     diff_style: "stacked",
     cursor: { blinking: false },
   })
   expect(() => decodeInfo({ leader_timeout: 0 })).toThrow()
   expect(() => decodeInfo({ attention: { volume: 1.1 } })).toThrow()
   expect(() => decodeInfo({ prompt: { max_width: 0 } })).toThrow()
+  expect(() => decodeInfo({ prompt: { queue_edit: "true" } })).toThrow()
   expect(() => decodeInfo({ scroll_speed: 0 })).toThrow()
   expect(() => decodeInfo({ cursor: { style: "beam" } })).toThrow()
   expect(decodeInfo({ attention: { sounds: { unknown: "sound.wav" } } })).toEqual({ attention: { sounds: {} } })

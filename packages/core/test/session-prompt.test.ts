@@ -1214,3 +1214,189 @@ describe("Session.inbox", () => {
     }),
   )
 })
+
+describe("Session.withdrawInbox", () => {
+  it.effect("fails for an unknown session", () =>
+    Effect.gen(function* () {
+      const session = yield* Session.Service
+      expect(
+        yield* session.withdrawInbox({ sessionID: Session.ID.make("ses_missing"), requestID: "req" }).pipe(Effect.flip),
+      ).toMatchObject({ _tag: "Session.NotFoundError" })
+    }),
+  )
+
+  it.effect("returns an empty receipt for a session without queued prompts", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const session = yield* Session.Service
+      wakeCalls.length = 0
+
+      expect(yield* session.withdrawInbox({ sessionID, requestID: "req_empty" })).toEqual([])
+      expect(yield* eventCount(Bus.versionedType(SessionEvent.InboxCancelled.type, 1))).toBe(0)
+      expect(wakeCalls).toEqual([])
+    }),
+  )
+
+  it.effect("withdraws queued user prompts in enqueue order and leaves other pending work", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const session = yield* Session.Service
+
+      const steered = yield* session.prompt({ sessionID, text: "Steered", resume: false })
+      const first = yield* session.prompt({ sessionID, text: "Queued first", delivery: "queue", resume: false })
+      const synthetic = yield* session.synthetic({ sessionID, text: "Synthetic", delivery: "queue", resume: false })
+      const barrier = yield* session.compact({ sessionID, delivery: "queue" })
+      const second = yield* session.prompt({ sessionID, text: "Queued second", delivery: "queue", resume: false })
+      wakeCalls.length = 0
+
+      const withdrawn = yield* session.withdrawInbox({ sessionID, requestID: "req_1" })
+
+      expect(withdrawn).toEqual([first, second])
+      expect(withdrawn.map((item) => item.payload.text)).toEqual(["Queued first", "Queued second"])
+      expect((yield* session.inbox(sessionID)).map((item) => item.id)).toEqual([steered.id, synthetic.id, barrier.id])
+      expect(yield* eventCount(Bus.versionedType(SessionEvent.InboxCancelled.type, 1))).toBe(2)
+      expect(yield* session.messages({ sessionID })).toEqual([])
+      expect(wakeCalls).toEqual([])
+    }),
+  )
+
+  it.effect("keeps pending move controls", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const session = yield* Session.Service
+      const bus = yield* Bus.Service
+      const moveID = SessionMessage.ID.create()
+      yield* bus.publish(SessionEvent.InboxEnqueued, {
+        sessionID,
+        inboxID: moveID,
+        item: {
+          type: "move",
+          payload: { location: { directory: AbsolutePath.make("/elsewhere") }, projectID: Project.ID.global },
+          delivery: "queue",
+        },
+      })
+      const queued = yield* session.prompt({ sessionID, text: "Queued", delivery: "queue", resume: false })
+
+      expect(yield* session.withdrawInbox({ sessionID, requestID: "req_move" })).toEqual([queued])
+      expect(yield* session.inbox(sessionID)).toMatchObject([{ id: moveID, type: "move" }])
+    }),
+  )
+
+  it.effect("replays the original receipt for a repeated requestID", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const session = yield* Session.Service
+
+      const first = yield* session.prompt({ sessionID, text: "Original", delivery: "queue", resume: false })
+      const original = yield* session.withdrawInbox({ sessionID, requestID: "req_replay" })
+      expect(original).toEqual([first])
+
+      const later = yield* session.prompt({ sessionID, text: "Later", delivery: "queue", resume: false })
+      expect(yield* session.withdrawInbox({ sessionID, requestID: "req_replay" })).toEqual([first])
+      expect(yield* session.inbox(sessionID)).toMatchObject([{ id: later.id, delivery: "queue" }])
+      expect(yield* eventCount(Bus.versionedType(SessionEvent.InboxCancelled.type, 1))).toBe(1)
+
+      expect(yield* session.withdrawInbox({ sessionID, requestID: "req_other" })).toEqual([later])
+      expect(yield* session.inbox(sessionID)).toEqual([])
+      expect(yield* eventCount(Bus.versionedType(SessionEvent.InboxCancelled.type, 1))).toBe(2)
+
+      // Empty receipts replay too, even once new prompts exist.
+      expect(yield* session.withdrawInbox({ sessionID, requestID: "req_none" })).toEqual([])
+      yield* session.prompt({ sessionID, text: "After empty", delivery: "queue", resume: false })
+      expect(yield* session.withdrawInbox({ sessionID, requestID: "req_none" })).toEqual([])
+      expect(yield* session.inbox(sessionID)).toHaveLength(1)
+    }),
+  )
+
+  it.effect("scopes receipts to the session", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const session = yield* Session.Service
+      const { db } = yield* Database.Service
+      const otherID = Session.ID.make("ses_withdraw_other")
+      yield* db
+        .insert(SessionTable)
+        .values({
+          id: otherID,
+          project_id: Project.ID.global,
+          slug: "other",
+          directory: "/project",
+          title: "other",
+          version: "test",
+        })
+        .run()
+        .pipe(Effect.orDie)
+
+      const mine = yield* session.prompt({ sessionID, text: "Mine", delivery: "queue", resume: false })
+      const theirs = yield* session.prompt({ sessionID: otherID, text: "Theirs", delivery: "queue", resume: false })
+
+      expect(yield* session.withdrawInbox({ sessionID, requestID: "req_shared" })).toEqual([mine])
+      expect(yield* session.withdrawInbox({ sessionID: otherID, requestID: "req_shared" })).toEqual([theirs])
+    }),
+  )
+
+  it.effect("never delivers and withdraws the same prompt under concurrent promotion", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const session = yield* Session.Service
+      const bus = yield* Bus.Service
+      const { db } = yield* Database.Service
+
+      const outcomes = new Set<number>()
+      for (let round = 0; round < 24; round++) {
+        const first = yield* session.prompt({ sessionID, text: `Round ${round} A`, delivery: "queue", resume: false })
+        const second = yield* session.prompt({ sessionID, text: `Round ${round} B`, delivery: "queue", resume: false })
+        const requestID = `req_race_${round}`
+        const withdraw = session.withdrawInbox({ sessionID, requestID })
+        const promote = SessionInbox.promote(db, bus, sessionID, "input").pipe(Effect.as([]))
+
+        // Alternate who reaches the inbox lock first so both interleavings are covered.
+        const results = yield* Effect.all(
+          round % 2 === 0 ? [withdraw, promote, promote] : [promote, withdraw, promote],
+          {
+            concurrency: "unbounded",
+          },
+        )
+        const withdrawn = results.flat()
+
+        const delivered = new Set((yield* session.messages({ sessionID })).map((message) => message.id))
+        for (const item of [first, second]) {
+          const wasWithdrawn = withdrawn.some((entry) => entry.id === item.id)
+          expect(wasWithdrawn !== delivered.has(item.id)).toBeTrue()
+        }
+        expect(yield* session.inbox(sessionID)).toEqual([])
+        expect(yield* session.withdrawInbox({ sessionID, requestID })).toEqual(withdrawn)
+        outcomes.add(withdrawn.length)
+      }
+      // Both a promotion and a withdrawal won at least one race.
+      expect(outcomes.size).toBeGreaterThan(1)
+    }),
+  )
+
+  it.effect("bounds receipts per session by evicting the oldest", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const session = yield* Session.Service
+
+      const oldest = yield* session.prompt({ sessionID, text: "Oldest", delivery: "queue", resume: false })
+      expect(yield* session.withdrawInbox({ sessionID, requestID: "req_0" })).toEqual([oldest])
+      const second = yield* session.prompt({ sessionID, text: "Second", delivery: "queue", resume: false })
+      expect(yield* session.withdrawInbox({ sessionID, requestID: "req_1" })).toEqual([second])
+
+      for (let index = 2; index < 64; index++) {
+        expect(yield* session.withdrawInbox({ sessionID, requestID: `req_${index}` })).toEqual([])
+      }
+      expect(yield* session.withdrawInbox({ sessionID, requestID: "req_0" })).toEqual([oldest])
+      expect(yield* session.withdrawInbox({ sessionID, requestID: "req_1" })).toEqual([second])
+
+      // The 65th distinct receipt evicts req_0, so replaying it withdraws current prompts instead.
+      expect(yield* session.withdrawInbox({ sessionID, requestID: "req_64" })).toEqual([])
+      expect(yield* session.withdrawInbox({ sessionID, requestID: "req_1" })).toEqual([second])
+      const fresh = yield* session.prompt({ sessionID, text: "Fresh", delivery: "queue", resume: false })
+      expect(yield* session.withdrawInbox({ sessionID, requestID: "req_0" })).toEqual([fresh])
+      // Recording req_0 again is the next eviction, which drops req_1.
+      expect(yield* session.withdrawInbox({ sessionID, requestID: "req_1" })).toEqual([])
+      expect(yield* session.withdrawInbox({ sessionID, requestID: "req_0" })).toEqual([fresh])
+    }),
+  )
+})

@@ -380,6 +380,12 @@ export type SessionInboxUpdateOperation<E = never> = (
   input: SessionInboxUpdateInput,
 ) => Effect.Effect<SessionInboxUpdateOutput, E>
 
+export type SessionInboxWithdrawInput = { readonly sessionID: Session.ID; readonly requestID: string }
+export type SessionInboxWithdrawOutput = ReadonlyArray<SessionInbox.User>
+export type SessionInboxWithdrawOperation<E = never> = (
+  input: SessionInboxWithdrawInput,
+) => Effect.Effect<SessionInboxWithdrawOutput, E>
+
 export type SessionInstructionsEntryListInput = { readonly sessionID: Session.ID }
 export type SessionInstructionsEntryListOutput = ReadonlyArray<InstructionEntry.Info>
 export type SessionInstructionsEntryListOperation<E = never> = (
@@ -1431,6 +1437,7 @@ export interface SessionApi<E = never> {
     readonly list: SessionInboxListOperation<E>
     readonly cancel: SessionInboxCancelOperation<E>
     readonly update: SessionInboxUpdateOperation<E>
+    readonly withdraw: SessionInboxWithdrawOperation<E>
   }
   readonly instructions: {
     readonly entry: {

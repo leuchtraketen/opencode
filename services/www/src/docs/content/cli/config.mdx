@@ -79,7 +79,7 @@ See [Theme](/cli/theme) for selecting and creating themes.
 
 ## Input
 
-Configure mouse capture, scrolling, editor context, pastes, and prompt image previews:
+Configure mouse capture, scrolling, editor context, pastes, prompt image previews, and queued prompt editing:
 
 ```json title="cli.json"
 {
@@ -91,7 +91,8 @@ Configure mouse capture, scrolling, editor context, pastes, and prompt image pre
   "prompt": {
     "editor": true,
     "paste": "compact",
-    "image_preview": false
+    "image_preview": false,
+    "queue_edit": false
   }
 }
 ```
@@ -106,8 +107,11 @@ Configure mouse capture, scrolling, editor context, pastes, and prompt image pre
 | `prompt.editor`            | boolean                         | Includes the active editor file or selection as prompt context.             |
 | `prompt.paste`             | `compact` or `full`             | Shows large pastes as compact placeholders or as full text.                  |
 | `prompt.image_preview`     | boolean                         | Shows image attachment previews above the prompt input.                     |
+| `prompt.queue_edit`        | boolean                         | Lets `Up` on an empty prompt withdraw queued prompts for editing.           |
 
 </div>
+
+With `prompt.queue_edit` enabled, press `Up` on an empty prompt to pull every prompt that is still queued for the active session back into the composer, in order and with attachments, while the active turn continues. Press `Enter` to send the edited draft as one prompt. When nothing is queued, `Up` recalls prompt history as usual. If you type, switch sessions, or close the prompt while a withdrawal is pending, the returned prompts are saved to the prompt stash instead of replacing your draft.
 
 ## Sessions
 

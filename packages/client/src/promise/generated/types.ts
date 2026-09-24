@@ -4428,6 +4428,13 @@ export type SessionInboxUpdateInput = {
 
 export type SessionInboxUpdateOutput = void
 
+export type SessionInboxWithdrawInput = {
+  readonly sessionID: { readonly sessionID: string }["sessionID"]
+  readonly requestID: { readonly requestID: string }["requestID"]
+}
+
+export type SessionInboxWithdrawOutput = { data: Array<SessionInboxUser> }["data"]
+
 export type SessionInstructionsEntryListInput = { readonly sessionID: { readonly sessionID: string }["sessionID"] }
 
 export type SessionInstructionsEntryListOutput = { data: Array<InstructionEntryInfo> }["data"]

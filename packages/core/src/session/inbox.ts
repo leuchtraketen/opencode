@@ -59,6 +59,15 @@ const decodeMessage = Schema.decodeUnknownSync(SessionMessage.Info)
 const inboxLocks = KeyedMutex.makeUnsafe<SessionSchema.ID>()
 type PendingRef = { readonly id: SessionMessage.ID; readonly sessionID: SessionSchema.ID }
 
+/**
+ * Withdrawal receipts are process-local by design: a client retrying the same
+ * requestID gets the original items back instead of withdrawing newer prompts,
+ * and a restart forgets them. The store keeps the newest receipts per session
+ * and the most recently withdrawing sessions overall, evicting in insertion order.
+ */
+const MaxReceiptsPerSession = 64
+const MaxReceiptSessions = 1024
+
 export const serialized = <A, E, R>(sessionID: SessionSchema.ID, effect: Effect.Effect<A, E, R>) =>
   inboxLocks.withLock(sessionID)(effect)
 
@@ -259,6 +268,82 @@ export const make = Effect.fn("SessionInbox.make")(function* () {
     ),
   )
 
+  const receipts = new Map<SessionSchema.ID, Map<string, ReadonlyArray<User>>>()
+  const remember = (sessionID: SessionSchema.ID, requestID: string, items: ReadonlyArray<User>) => {
+    const existing = receipts.get(sessionID)
+    // Re-insert so the session moves to the newest position before the global cap evicts.
+    receipts.delete(sessionID)
+    const session = existing ?? new Map<string, ReadonlyArray<User>>()
+    session.set(requestID, items)
+    for (const key of session.keys()) {
+      if (session.size <= MaxReceiptsPerSession) break
+      session.delete(key)
+    }
+    receipts.set(sessionID, session)
+    for (const key of receipts.keys()) {
+      if (receipts.size <= MaxReceiptSessions) break
+      receipts.delete(key)
+    }
+  }
+
+  const queuedUsers = (sessionID: SessionSchema.ID) =>
+    db
+      .select()
+      .from(SessionInboxTable)
+      .where(
+        and(
+          eq(SessionInboxTable.session_id, sessionID),
+          eq(SessionInboxTable.type, "user"),
+          eq(SessionInboxTable.delivery, "queue"),
+        ),
+      )
+      .orderBy(asc(SessionInboxTable.enqueued_seq))
+      .all()
+      .pipe(
+        Effect.orDie,
+        Effect.map((rows) => rows.map(fromRow).filter((item): item is User => item.type === "user")),
+      )
+
+  const cancelAll = (sessionID: SessionSchema.ID, items: ReadonlyArray<User>) => {
+    const cancellations = items.map((item) => [SessionEvent.InboxCancelled, { sessionID, inboxID: item.id }] as const)
+    const first = cancellations[0]
+    if (!first) return Effect.void
+    return bus.publishAll([first, ...cancellations.slice(1)]).pipe(
+      Effect.asVoid,
+      // Bus projectors abort their transaction through the defect channel.
+      Effect.catchDefect((defect) => (defect instanceof LifecycleConflict ? Effect.fail(defect) : Effect.die(defect))),
+    )
+  }
+
+  /**
+   * Atomically cancels every queued user prompt of the Session and returns them in
+   * enqueue order. Steered, synthetic, compaction and move rows stay pending.
+   */
+  const withdraw = Effect.fn("SessionInbox.withdraw")(function* (input: {
+    readonly sessionID: SessionSchema.ID
+    readonly requestID: string
+  }) {
+    return yield* serialized(
+      input.sessionID,
+      Effect.gen(function* () {
+        const replay = receipts.get(input.sessionID)?.get(input.requestID)
+        if (replay !== undefined) return replay
+        const items = yield* queuedUsers(input.sessionID)
+        // The inbox lock keeps promote and single-row mutations out, so a conflict
+        // means a row vanished outside it (Session deletion cascades). Re-read once
+        // against the current rows; a second conflict surfaces to the caller.
+        const withdrawn = yield* cancelAll(input.sessionID, items).pipe(
+          Effect.as(items),
+          Effect.catchTag("SessionInbox.LifecycleConflict", () =>
+            queuedUsers(input.sessionID).pipe(Effect.tap((current) => cancelAll(input.sessionID, current))),
+          ),
+        )
+        remember(input.sessionID, input.requestID, withdrawn)
+        return withdrawn
+      }),
+    )
+  })
+
   return {
     list: (sessionID: SessionSchema.ID) => list(db, sessionID),
     reconcile,
@@ -267,6 +352,7 @@ export const make = Effect.fn("SessionInbox.make")(function* () {
     cancel,
     steer,
     queue,
+    withdraw,
   }
 })
 

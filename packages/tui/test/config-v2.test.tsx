@@ -47,6 +47,36 @@ test("validates the session tabs setting", () => {
   expect(() => decode({ session: { new_location: "current" } })).toThrow()
 })
 
+test("queued prompt editing is optional and only accepts booleans", () => {
+  expect(decodeInfo({ prompt: {} })).toEqual({ prompt: {} })
+  expect(resolve(decodeInfo({}), { terminalSuspend: true }).prompt).toBeUndefined()
+  for (const queue_edit of [true, false]) {
+    const config = resolve(decodeInfo({ prompt: { queue_edit, image_preview: true } }), { terminalSuspend: true })
+    expect(config.prompt).toEqual({ queue_edit, image_preview: true })
+  }
+  for (const queue_edit of ["true", "false", 0, 1, null, [], {}]) {
+    expect(() => decodeInfo({ prompt: { queue_edit } })).toThrow()
+  }
+  expect(Schema.toJsonSchemaDocument(Info).schema).toMatchObject({
+    properties: {
+      prompt: {
+        anyOf: [
+          {
+            type: "object",
+            properties: {
+              queue_edit: {
+                anyOf: [{ type: "boolean" }, { type: "null" }],
+                description: "Use the previous-history key on an empty prompt to withdraw queued prompts for editing",
+              },
+            },
+          },
+          { type: "null" },
+        ],
+      },
+    },
+  })
+})
+
 test("resolves nested config and keybind defaults", () => {
   const config = resolve(
     {

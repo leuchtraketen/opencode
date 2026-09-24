@@ -154,6 +154,7 @@ test("migrates tui and kv config into cli.json", async () => {
       scroll_speed: 2,
       scroll_acceleration: { enabled: true },
       diff_style: "stacked",
+      prompt: { queue_edit: true, max_height: 10 },
       mouse: false,
     }),
   )
@@ -203,7 +204,7 @@ test("migrates tui and kv config into cli.json", async () => {
     attention: { sound_pack: "custom.pack" },
     diffs: { wrap: "none", tree: false, single: true, view: "split" },
     terminal: { title: false },
-    prompt: { editor: false, paste: "full" },
+    prompt: { editor: false, paste: "full", queue_edit: true },
     session: { sidebar: "hide", scrollbar: true, thinking: "show", grouping: "none" },
     animations: false,
     mouse: false,

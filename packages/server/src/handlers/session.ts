@@ -561,6 +561,25 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
         }),
       )
       .handle(
+        "session.inbox.withdraw",
+        Effect.fn(function* (ctx) {
+          return {
+            data: yield* session
+              .withdrawInbox({ sessionID: ctx.params.sessionID, requestID: ctx.payload.requestID })
+              .pipe(
+                Effect.catchTag("Session.NotFoundError", missingSession),
+                Effect.catchTag(
+                  "Session.InboxConflictError",
+                  (error) =>
+                    new InvalidRequestError({
+                      message: `Queued prompts changed while withdrawing: ${error.inboxID}. Retry the withdrawal.`,
+                    }),
+                ),
+              ),
+          }
+        }),
+      )
+      .handle(
         "session.instructions.entry.list",
         Effect.fn(function* (ctx) {
           const instructions = yield* InstructionEntry.Service

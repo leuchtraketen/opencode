@@ -242,6 +242,15 @@ export const settings: Setting[] = [
     keywords: ["attachments", "clipboard", "images", "prompt"],
   },
   {
+    title: "Queued prompt editing",
+    category: "Input",
+    path: ["prompt", "queue_edit"],
+    default: false,
+    values: [false, true],
+    labels: ["off", "on"],
+    keywords: ["queue", "withdraw", "history", "edit queued prompts"],
+  },
+  {
     title: "Leader timeout",
     category: "Input",
     path: ["leader", "timeout"],

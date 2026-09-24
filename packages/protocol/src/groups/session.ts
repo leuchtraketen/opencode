@@ -643,6 +643,23 @@ export const makeSessionGroup = <
       ),
     )
     .add(
+      HttpApiEndpoint.post("session.inbox.withdraw", "/api/session/:sessionID/inbox/withdraw", {
+        params: { sessionID: Session.ID },
+        payload: Schema.Struct({
+          requestID: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(128)),
+        }),
+        success: Schema.Struct({ data: Schema.Array(SessionInbox.User) }),
+        error: [InvalidRequestError, SessionNotFoundError],
+      }).annotateMerge(
+        OpenApi.annotations({
+          identifier: "session.inbox.withdraw",
+          summary: "Withdraw queued prompts",
+          description:
+            "Atomically remove every pending user prompt with queue delivery and return them in enqueue order so the client can edit and resubmit them. Steered, synthetic, compaction, and move items stay pending. Repeating a requestID replays the receipt of the original withdrawal for the lifetime of the server process instead of withdrawing newer prompts.",
+        }),
+      ),
+    )
+    .add(
       HttpApiEndpoint.get(
         "session.instructions.entry.list",
         "/api/experimental/session/:sessionID/instructions/entries",

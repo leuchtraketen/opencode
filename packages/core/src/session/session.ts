@@ -143,6 +143,18 @@ export const make = Effect.fn("Session.make")(function* () {
     (sessionID: SessionSchema.ID, inboxID: SessionMessage.ID) => mutatePending(sessionID, inboxID, admission.queue),
     Effect.uninterruptible,
   )
+  // Nothing new is admitted, so execution is not woken.
+  const withdrawInbox = Effect.fn("Session.withdrawInbox")(function* (sessionID: SessionSchema.ID, requestID: string) {
+    yield* get(sessionID)
+    return yield* admission.withdraw({ sessionID, requestID }).pipe(
+      Effect.catchTag("SessionInbox.LifecycleConflict", (conflict) =>
+        Effect.gen(function* () {
+          yield* get(sessionID)
+          return yield* new InboxConflictError({ sessionID, inboxID: conflict.id })
+        }),
+      ),
+    )
+  }, Effect.uninterruptible)
   const prompt = Effect.fn("Session.prompt")((sessionID: SessionSchema.ID, input: PromptRequest) =>
     Effect.uninterruptibleMask((restore) =>
       Effect.gen(function* () {
@@ -365,6 +377,7 @@ export const make = Effect.fn("Session.make")(function* () {
     cancelInbox,
     steerInbox,
     queueInbox,
+    withdrawInbox,
     revert,
   }
 
@@ -389,6 +402,7 @@ export const make = Effect.fn("Session.make")(function* () {
     const cancelInbox = operations.cancelInbox.bind(undefined, sessionID)
     const steerInbox = operations.steerInbox.bind(undefined, sessionID)
     const queueInbox = operations.queueInbox.bind(undefined, sessionID)
+    const withdrawInbox = operations.withdrawInbox.bind(undefined, sessionID)
     const stage = operations.revert.stage.bind(undefined, sessionID)
     const clear = operations.revert.clear.bind(undefined, sessionID)
     const commit = operations.revert.commit.bind(undefined, sessionID)
@@ -416,6 +430,7 @@ export const make = Effect.fn("Session.make")(function* () {
       cancelInbox,
       steerInbox,
       queueInbox,
+      withdrawInbox,
       revert,
     }
   }

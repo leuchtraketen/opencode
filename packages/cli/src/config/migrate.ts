@@ -226,7 +226,9 @@ export function migrateV1(legacy: TuiConfigV1.Info | undefined, kv: Record<strin
           },
         }),
     ...(kv.terminal_title_enabled === undefined ? {} : { terminal: { title: kv.terminal_title_enabled } }),
-    ...(kv.file_context_enabled === undefined && kv.paste_summary_enabled === undefined
+    ...(kv.file_context_enabled === undefined &&
+    kv.paste_summary_enabled === undefined &&
+    legacy?.prompt?.queue_edit === undefined
       ? {}
       : {
           prompt: {
@@ -234,6 +236,7 @@ export function migrateV1(legacy: TuiConfigV1.Info | undefined, kv: Record<strin
             ...(kv.paste_summary_enabled === undefined
               ? {}
               : { paste: kv.paste_summary_enabled ? ("compact" as const) : ("full" as const) }),
+            ...(legacy?.prompt?.queue_edit === undefined ? {} : { queue_edit: legacy.prompt.queue_edit }),
           },
         }),
     ...(kv.sidebar === undefined &&

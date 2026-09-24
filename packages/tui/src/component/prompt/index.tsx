@@ -35,6 +35,7 @@ import { saveDraft, takeDraft } from "./draft-stash"
 import { Skill } from "@opencode/schema/skill"
 import { computePromptTraits } from "../../prompt/traits"
 import { expandPastedTextPlaceholders, expandTrackedPastedText } from "../../prompt/part"
+import { promptQueue, trimPromptTail } from "../../prompt/queue"
 import { usePromptStash } from "../../prompt/stash"
 import { DialogStash } from "../dialog-stash"
 import { type AutocompleteOption, type AutocompleteRef, Autocomplete } from "./autocomplete"
@@ -210,6 +211,8 @@ export function Prompt(props: PromptProps) {
   const status = createMemo(() => data.session.status(props.sessionID ?? ""))
   const history = usePromptHistory()
   const stash = usePromptStash()
+  const queue = promptQueue(client)
+  const queueEdit = () => config.prompt?.queue_edit === true
   const keymap = Keymap.use()
   const renderer = useRenderer()
   const exit = useExit()
@@ -368,6 +371,12 @@ export function Prompt(props: PromptProps) {
     interrupt: 0,
   })
   let disposed = false
+  // Bumped whenever the draft or its session changes, so a withdrawal response
+  // can tell whether the empty prompt that requested it is still the same one.
+  let promptRevision = 0
+  // Bumped when a withdrawal starts, so an Enter deferred before it cannot
+  // resubmit the draft it restores.
+  let withdrawalRevision = 0
   let pasteQueue = Promise.resolve()
 
   function enqueuePaste(run: (changed: () => boolean) => Promise<void>) {
@@ -408,6 +417,7 @@ export function Prompt(props: PromptProps) {
     on(
       () => props.sessionID,
       () => {
+        promptRevision++
         setStore("placeholder", randomIndex(list().length))
       },
       { defer: true },
@@ -698,6 +708,16 @@ export function Prompt(props: PromptProps) {
     setStore("prompt", emptyPrompt())
     setStore("extmarkToPart", new Map())
     input.clear()
+  }
+
+  function promptEmpty() {
+    return (
+      !input.plainText &&
+      !store.prompt.files?.length &&
+      !store.prompt.agents?.length &&
+      !store.prompt.skills?.length &&
+      !store.prompt.pasted.length
+    )
   }
 
   // Captured once: the session route is keyed by sessionID, so this Prompt
@@ -1030,13 +1050,63 @@ export function Prompt(props: PromptProps) {
               return
             }
 
-            const item = history.move(-1, input.plainText)
-            if (!item) return false
-            input.setText(item.text)
-            setStore("prompt", item)
-            setStore("mode", item.mode ?? "normal")
-            restoreExtmarksFromPrompt(item)
-            input.cursorOffset = 0
+            const previous = () => {
+              const item = history.move(-1, input.plainText)
+              if (!item) return false
+              input.setText(item.text)
+              setStore("prompt", item)
+              setStore("mode", item.mode ?? "normal")
+              restoreExtmarksFromPrompt(item)
+              input.cursorOffset = 0
+            }
+            const sessionID = props.sessionID
+            if (!queueEdit() || !sessionID || store.mode !== "normal" || !promptEmpty()) return previous()
+            if (queue.busy(sessionID)) return
+
+            const revision = promptRevision
+            withdrawalRevision++
+            void queue
+              .withdraw(sessionID, {
+                current: () =>
+                  !disposed &&
+                  !input.isDestroyed &&
+                  props.sessionID === sessionID &&
+                  promptRevision === revision &&
+                  store.mode === "normal" &&
+                  promptEmpty(),
+                restore: (prompt) => {
+                  // Withdrawn prompts are a draft to append to, so open a fresh
+                  // trailing line and leave the cursor there. The blank line
+                  // matches the separator between the withdrawn prompts.
+                  ref.set({ ...prompt, text: `${prompt.text}\n\n` })
+                  setStore("mode", "normal")
+                  // Restoring can race a focus effect that puts the cursor back
+                  // at the buffer start; re-assert the end once updates flushed.
+                  // Only correct that case: anything else means the draft moved on.
+                  const restored = input.plainText
+                  setTimeout(() => {
+                    if (disposed || !input || input.isDestroyed) return
+                    if (input.cursorOffset !== 0 || input.plainText !== restored) return
+                    input.gotoBufferEnd()
+                    renderer.requestRender()
+                  }, 0)
+                },
+                save: (prompt) => {
+                  stash.push({ prompt })
+                  toast.show({
+                    message: "Withdrawn prompts saved in the prompt stash; your current draft was left unchanged.",
+                    variant: "info",
+                  })
+                },
+                empty: previous,
+              })
+              .catch((error) => {
+                toast.show({
+                  title: "Failed to withdraw queued prompts",
+                  message: errorMessage(error),
+                  variant: "error",
+                })
+              })
           },
         },
       ],
@@ -1092,6 +1162,8 @@ export function Prompt(props: PromptProps) {
     // ultimately reads the now-empty store — sending a phantom empty prompt
     // to a freshly created session.
     if (submitting) return false
+    // A withdrawal in flight would race the submission for the same queue.
+    if (queueEdit() && props.sessionID && queue.busy(props.sessionID)) return false
     submitting = true
     try {
       return await submitInner(delivery)
@@ -1114,8 +1186,10 @@ export function Prompt(props: PromptProps) {
     if (!trimmed && (!props.sessionID || store.mode === "shell" || delivery === "queue"))
       return delivery === "steer" ? (await props.onEmptySubmit?.()) === true : false
     const exitWord = trimmed === "exit" || trimmed === "quit" || trimmed === ":q"
+    // A withdrawn draft carries an editing blank line that must not go on the wire.
+    const composed = queueEdit() ? trimPromptTail(store.prompt) : store.prompt
     const inputText = expandTrackedPastedText(
-      store.prompt.text,
+      composed.text,
       input.extmarks.getAllForTypeId(promptPartTypeId).flatMap((extmark) => {
         const ref = store.extmarkToPart.get(extmark.id)
         if (ref?.type !== "pasted") return []
@@ -1172,7 +1246,7 @@ export function Prompt(props: PromptProps) {
     // (which may have absorbed mid-flight typing). Failure paths restore the
     // snapshot unless the user has started typing something new.
     const currentMode = store.mode
-    const entry = { ...store.prompt, mode: currentMode }
+    const entry = { ...composed, mode: currentMode }
     if (trimmed) {
       resetComposer()
       props.onSubmit?.()
@@ -1344,21 +1418,23 @@ export function Prompt(props: PromptProps) {
       // and rolls back if the server rejects it, so submission does not wait
       // on the network. On rejection the row is already rolled back; restore
       // the composer unless the user has started typing something new.
-      data.session
-        .prompt({
-          sessionID: target,
-          text: inputText,
-          files: entry.files,
-          agents: entry.agents,
-          skills: entry.skills?.length ? entry.skills : undefined,
-          delivery,
-          gate: newSession?.gate,
-          // Commit the captured selection after earlier admissions, including
-          // compaction setup. Cached state may still precede their SSE echoes;
-          // the server makes an unchanged selection a no-op.
-          prepare: commitModel,
-        })
-        .catch((error) => (newSession ? newSession.recover(error) : fail("Failed to send prompt", error)))
+      const admission = data.session.prompt({
+        sessionID: target,
+        text: inputText,
+        files: entry.files,
+        agents: entry.agents,
+        skills: entry.skills?.length ? entry.skills : undefined,
+        delivery,
+        gate: newSession?.gate,
+        // Commit the captured selection after earlier admissions, including
+        // compaction setup. Cached state may still precede their SSE echoes;
+        // the server makes an unchanged selection a no-op.
+        prepare: commitModel,
+      })
+      // A withdrawal requested right after Enter waits for this admission so
+      // the prompt just sent is part of the batch.
+      if (queueEdit()) queue.admit(target, admission)
+      admission.catch((error) => (newSession ? newSession.recover(error) : fail("Failed to send prompt", error)))
       if (pendingEditorSelection) editor.markSelectionSent()
     }
 
@@ -1509,7 +1585,7 @@ export function Prompt(props: PromptProps) {
       (store.prompt.agents?.length ?? 0) > 0
     ) {
       history.append({
-        ...store.prompt,
+        ...(queueEdit() ? trimPromptTail(store.prompt) : store.prompt),
         mode: store.mode,
       })
     }
@@ -1743,6 +1819,7 @@ export function Prompt(props: PromptProps) {
               maxHeight={maxHeight()}
               cursorStyle={config.cursor}
               onContentChange={() => {
+                promptRevision++
                 const value = input.plainText
                 setStore("prompt", "text", value)
                 auto()?.onInput(value)
@@ -1758,9 +1835,18 @@ export function Prompt(props: PromptProps) {
               }}
               onSubmit={() => {
                 if (disabled()) return
+                const revision = withdrawalRevision
                 // IME: double-defer so the last composed character (e.g. Korean
                 // hangul) is flushed to plainText before we read it for submission.
-                setTimeout(() => setTimeout(() => submit(), 0), 0)
+                setTimeout(
+                  () =>
+                    setTimeout(() => {
+                      // A withdrawal started meanwhile; its restored draft is not what this Enter meant.
+                      if (revision !== withdrawalRevision) return
+                      void submit()
+                    }, 0),
+                  0,
+                )
               }}
               onPaste={(event: PasteEvent) => {
                 if (disabled()) {

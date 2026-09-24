@@ -156,6 +156,15 @@ export interface Interface {
   readonly steerInbox: (input: InboxItemRef) => Effect.Effect<void, NotFoundError | InboxConflictError>
   readonly queueInbox: (input: InboxItemRef) => Effect.Effect<void, NotFoundError | InboxConflictError>
   /**
+   * Atomically withdraws every queued user prompt in enqueue order so the client can
+   * edit and resubmit. Repeating a requestID replays the original receipt for the
+   * lifetime of the process.
+   */
+  readonly withdrawInbox: (input: {
+    readonly sessionID: SessionSchema.ID
+    readonly requestID: string
+  }) => Effect.Effect<ReadonlyArray<SessionInbox.User>, NotFoundError | InboxConflictError>
+  /**
    * Durable, ordered session log read. Replays durable session bus after
    * the exclusive `after` cursor, emits a `Synced` marker at the captured
    * replay watermark, then continues live when `follow` is set.
@@ -390,6 +399,7 @@ const layer = Layer.effect(
       cancelInbox: (input) => sessions.forSession(input.sessionID).cancelInbox(input.inboxID),
       steerInbox: (input) => sessions.forSession(input.sessionID).steerInbox(input.inboxID),
       queueInbox: (input) => sessions.forSession(input.sessionID).queueInbox(input.inboxID),
+      withdrawInbox: (input) => sessions.forSession(input.sessionID).withdrawInbox(input.requestID),
       log: (input) =>
         Stream.unwrap(
           result

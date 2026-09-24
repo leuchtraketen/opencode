@@ -68,6 +68,8 @@ import type {
   SessionInboxCancelOutput,
   SessionInboxUpdateInput,
   SessionInboxUpdateOutput,
+  SessionInboxWithdrawInput,
+  SessionInboxWithdrawOutput,
   SessionInstructionsEntryListInput,
   SessionInstructionsEntryListOutput,
   SessionInstructionsEntryPutInput,
@@ -885,6 +887,18 @@ export function make(options: ClientOptions) {
             },
             requestOptions,
           ),
+        withdraw: (input: SessionInboxWithdrawInput, requestOptions?: RequestOptions) =>
+          request<{ readonly data: SessionInboxWithdrawOutput }>(
+            {
+              method: "POST",
+              path: `/api/session/${encodeURIComponent(input.sessionID)}/inbox/withdraw`,
+              body: { requestID: input["requestID"] },
+              successStatus: 200,
+              declaredStatuses: [400, 401, 404],
+              empty: false,
+            },
+            requestOptions,
+          ).then((value) => value.data),
       },
       instructions: {
         entry: {

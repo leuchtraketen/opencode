@@ -140,6 +140,9 @@ export const Info = Schema.Struct({
       image_preview: Schema.optional(Schema.Boolean).annotate({
         description: "Show image attachment previews above the prompt input",
       }),
+      queue_edit: Schema.optional(Schema.Boolean).annotate({
+        description: "Use the previous-history key on an empty prompt to withdraw queued prompts for editing",
+      }),
     }),
   ).annotate({ description: "Prompt input behavior" }),
   session: Schema.optional(

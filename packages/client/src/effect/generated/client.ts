@@ -74,6 +74,8 @@ import type {
   SessionInboxCancelOutput,
   SessionInboxUpdateInput,
   SessionInboxUpdateOutput,
+  SessionInboxWithdrawInput,
+  SessionInboxWithdrawOutput,
   SessionInstructionsEntryListInput,
   SessionInstructionsEntryListOutput,
   SessionInstructionsEntryPutInput,
@@ -613,6 +615,17 @@ const EndpointSessionInboxUpdate = (raw: RawClient["server.session"]) => (input:
     }).pipe(Effect.mapError(mapClientError)),
   )
 
+const EndpointSessionInboxWithdraw = (raw: RawClient["server.session"]) => (input: SessionInboxWithdrawInput) =>
+  preserveEffect<SessionInboxWithdrawOutput>()(
+    raw["session.inbox.withdraw"]({
+      params: { sessionID: input["sessionID"] },
+      payload: { requestID: input["requestID"] },
+    }).pipe(
+      Effect.mapError(mapClientError),
+      Effect.map((value) => value.data),
+    ),
+  )
+
 const EndpointSessionInstructionsEntryList =
   (raw: RawClient["server.session"]) => (input: SessionInstructionsEntryListInput) =>
     preserveEffect<SessionInstructionsEntryListOutput>()(
@@ -769,6 +782,7 @@ const adaptGroupSession = (raw: RawClient["server.session"]) => ({
     list: EndpointSessionInboxList(raw),
     cancel: EndpointSessionInboxCancel(raw),
     update: EndpointSessionInboxUpdate(raw),
+    withdraw: EndpointSessionInboxWithdraw(raw),
   },
   instructions: {
     entry: {
