@@ -593,9 +593,10 @@ const events = {
       info: SessionInfo,
     },
   }),
+  // Full snapshot of one message: only the latest per message is kept in the durable log.
   MessageUpdated: define({
     type: "message.updated",
-    ...options,
+    durable: { ...options.durable, supersedes: "info.id" },
     schema: {
       sessionID: SessionID,
       info: Info,
@@ -609,9 +610,10 @@ const events = {
       messageID: MessageID,
     },
   }),
+  // Full snapshot of one part: only the latest per part is kept in the durable log.
   PartUpdated: define({
     type: "message.part.updated",
-    ...options,
+    durable: { ...options.durable, supersedes: "part.id" },
     schema: {
       sessionID: SessionID,
       part: Part,

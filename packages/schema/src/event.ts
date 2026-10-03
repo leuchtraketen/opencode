@@ -12,15 +12,26 @@ export const ID = Schema.String.check(Schema.isStartsWith("evt_")).pipe(
 )
 export type ID = typeof ID.Type
 
+/**
+ * Durable (event-sourced) settings of an event definition.
+ *
+ * `supersedes` marks a snapshot-style event: its data carries the complete state of one entity, so a newer
+ * event for the same entity makes every older one redundant. It names the dot-separated path inside `data`
+ * that identifies that entity (e.g. `info.id` for `message.updated`). The event log keeps only the latest
+ * snapshot per `(aggregate, type, entity)`; see `EventV2.commitDurableEvent`.
+ */
+export type DurableOptions = {
+  readonly version: number
+  readonly aggregate: string
+  readonly supersedes?: string
+}
+
 export type Definition<
   Type extends string = string,
   DataSchema extends Schema.Codec<unknown, unknown> = Schema.Codec<unknown, unknown>,
 > = Schema.Top & {
   readonly type: Type
-  readonly durable?: {
-    readonly version: number
-    readonly aggregate: string
-  }
+  readonly durable?: DurableOptions
   readonly data: DataSchema
 }
 
@@ -42,14 +53,7 @@ export type Payload<D extends Definition = Definition> = {
 export function define<
   const Type extends string,
   const Fields extends Readonly<Record<PropertyKey, Schema.Codec<unknown, unknown>>>,
->(input: {
-  readonly type: Type
-  readonly durable?: {
-    readonly version: number
-    readonly aggregate: string
-  }
-  readonly schema: Fields
-}) {
+>(input: { readonly type: Type; readonly durable?: DurableOptions; readonly schema: Fields }) {
   const data = Schema.Struct(input.schema)
   return Schema.Struct({
     id: ID,

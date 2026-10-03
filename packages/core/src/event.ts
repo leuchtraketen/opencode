@@ -3,7 +3,7 @@ export * as EventV2 from "./event"
 import { Cause, Context, Effect, Layer, Option, PubSub, Queue, Schema, Stream } from "effect"
 import { Event } from "@opencode-ai/schema/event"
 import type { Data, Definition, Payload } from "@opencode-ai/schema/event"
-import { and, asc, eq, gt, inArray } from "drizzle-orm"
+import { and, asc, eq, gt, inArray, lt } from "drizzle-orm"
 import { Database } from "./database/database"
 import { EventSequenceTable, EventTable } from "./event/sql"
 import { Location } from "./location"
@@ -106,6 +106,18 @@ export const readAggregate = Effect.fn("EventV2.readAggregate")(function* <A>(
     hasMore: rows.length > input.limit,
   }
 })
+
+/**
+ * Resolves `Event.DurableOptions.supersedes` (a dot-separated path such as `info.id`) against the encoded
+ * event data. Returns the entity identity, or `undefined` when the path does not lead to a string.
+ */
+export function entityIdentity(data: Record<string, unknown>, path: string): string | undefined {
+  const value = path.split(".").reduce<unknown>((current, key) => {
+    if (typeof current !== "object" || current === null) return undefined
+    return (current as Record<string, unknown>)[key]
+  }, data)
+  return typeof value === "string" ? value : undefined
+}
 
 export class SubscriberOverflowError extends Schema.TaggedErrorClass<SubscriberOverflowError>()(
   "EventV2.SubscriberOverflow",
@@ -251,6 +263,15 @@ export const layerWith = (options?: LayerOptions) =>
                             string,
                             unknown
                           >
+                          const entityID = durable.supersedes ? entityIdentity(encoded, durable.supersedes) : undefined
+                          if (durable.supersedes && entityID === undefined) {
+                            yield* Effect.die(
+                              new InvalidDurableEventError({
+                                type: event.type,
+                                message: `Expected string entity field ${durable.supersedes}`,
+                              }),
+                            )
+                          }
                           if (input?.strictOwner && row?.ownerID && row.ownerID !== input.ownerID) {
                             yield* Effect.die(
                               new InvalidDurableEventError({
@@ -342,10 +363,31 @@ export const layerWith = (options?: LayerOptions) =>
                                 seq,
                                 type: versionedType(definition.type, durable.version),
                                 data: encoded,
+                                entity_id: entityID,
                               },
                             ])
                             .run()
                             .pipe(Effect.orDie)
+                          // Snapshot collapse: the event just written fully describes its entity, so older
+                          // snapshots of the same entity are redundant and are dropped from the log. Only
+                          // locally authored events collapse; a replayed aggregate must mirror its source
+                          // row for row, because replay re-delivery is verified against the stored row at
+                          // the same sequence. The log keeps its sequence gaps; readers that resume with
+                          // `seq > after` are unaffected, strict contiguous replay of such a log is not.
+                          if (!input && entityID !== undefined) {
+                            yield* db
+                              .delete(EventTable)
+                              .where(
+                                and(
+                                  eq(EventTable.aggregate_id, aggregateID),
+                                  eq(EventTable.type, versionedType(definition.type, durable.version)),
+                                  eq(EventTable.entity_id, entityID),
+                                  lt(EventTable.seq, seq),
+                                ),
+                              )
+                              .run()
+                              .pipe(Effect.orDie)
+                          }
                           return { aggregateID, seq }
                         }),
                       { behavior: "immediate" },

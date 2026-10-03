@@ -41,6 +41,20 @@ const SyncMessage = EventV2.define({
   },
 })
 
+const SnapshotMessage = EventV2.define({
+  type: "test.snapshot",
+  durable: {
+    version: 1,
+    aggregate: "id",
+    supersedes: "entity.id",
+  },
+  schema: {
+    id: Schema.String,
+    entity: Schema.Struct({ id: Schema.String }),
+    text: Schema.String,
+  },
+})
+
 const SyncSent = EventV2.define({
   type: "test.sent",
   durable: {
@@ -76,6 +90,18 @@ const DurableMessage = SessionV1.Event.MessageRemoved
 const durableData = (sessionID: Session.ID, text: string) => ({
   sessionID,
   messageID: SessionV1.MessageID.ascending(`msg_${text}`),
+})
+// Two snapshots of the same text part (same part id), differing only in their text.
+const partSnapshot = (sessionID: Session.ID, text: string) => ({
+  sessionID,
+  part: {
+    id: SessionV1.PartID.ascending("prt_fixed"),
+    sessionID,
+    messageID: SessionV1.MessageID.ascending("msg_fixed"),
+    type: "text" as const,
+    text,
+  },
+  time: 1,
 })
 
 const it = testEffect(
@@ -583,6 +609,104 @@ describe("EventV2", () => {
 
       expect(rows).toHaveLength(1)
       expect(rows[0]?.aggregate_id).toBe(aggregateID)
+    }),
+  )
+
+  it.effect("keeps only the latest snapshot per entity for locally published superseding events", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const { db } = yield* Database.Service
+      const aggregateID = EventV2.ID.create()
+
+      yield* events.publish(SnapshotMessage, { id: aggregateID, entity: { id: "a" }, text: "a1" })
+      yield* events.publish(SnapshotMessage, { id: aggregateID, entity: { id: "b" }, text: "b1" })
+      yield* events.publish(SnapshotMessage, { id: aggregateID, entity: { id: "a" }, text: "a2" })
+      yield* events.publish(SyncMessage, { id: aggregateID, text: "other type, same aggregate" })
+
+      const rows = yield* db
+        .select()
+        .from(EventTable)
+        .where(eq(EventTable.aggregate_id, aggregateID))
+        .orderBy(EventTable.seq)
+        .all()
+        .pipe(Effect.orDie)
+      const sequence = yield* db
+        .select()
+        .from(EventSequenceTable)
+        .where(eq(EventSequenceTable.aggregate_id, aggregateID))
+        .get()
+        .pipe(Effect.orDie)
+
+      expect(rows.map((row) => [row.seq, row.type, row.entity_id, (row.data as { text: string }).text])).toEqual([
+        [1, "test.snapshot.1", "b", "b1"],
+        [2, "test.snapshot.1", "a", "a2"],
+        [3, "test.sync.1", null, "other type, same aggregate"],
+      ])
+      expect(sequence?.seq).toBe(3)
+    }),
+  )
+
+  it.effect("resumes a collapsed durable log after the surviving snapshot", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const aggregateID = Session.ID.create()
+
+      yield* events.publish(SessionV1.Event.PartUpdated, partSnapshot(aggregateID, "first"))
+      yield* events.publish(SessionV1.Event.PartUpdated, partSnapshot(aggregateID, "second"))
+
+      const historical = Array.from(yield* events.durable({ aggregateID }).pipe(Stream.take(1), Stream.runCollect))
+
+      expect(
+        historical.map((event) => [event.durable?.seq, (event.data as { part: { text: string } }).part.text]),
+      ).toEqual([[1, "second"]])
+    }),
+  )
+
+  it.effect("does not collapse replayed snapshots", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const { db } = yield* Database.Service
+      const aggregateID = Session.ID.create()
+
+      yield* events.replayAll([
+        {
+          id: EventV2.ID.create(),
+          type: EventV2.versionedType(SessionV1.Event.PartUpdated.type, 1),
+          seq: 0,
+          aggregateID,
+          data: partSnapshot(aggregateID, "first"),
+        },
+        {
+          id: EventV2.ID.create(),
+          type: EventV2.versionedType(SessionV1.Event.PartUpdated.type, 1),
+          seq: 1,
+          aggregateID,
+          data: partSnapshot(aggregateID, "second"),
+        },
+      ])
+
+      const rows = yield* db
+        .select({ seq: EventTable.seq, entity_id: EventTable.entity_id })
+        .from(EventTable)
+        .where(eq(EventTable.aggregate_id, aggregateID))
+        .orderBy(EventTable.seq)
+        .all()
+        .pipe(Effect.orDie)
+
+      expect(rows).toEqual([
+        { seq: 0, entity_id: "prt_fixed" },
+        { seq: 1, entity_id: "prt_fixed" },
+      ])
+    }),
+  )
+
+  it.effect("declares message and part snapshots as superseding by their entity id", () =>
+    Effect.sync(() => {
+      expect(SessionV1.Event.MessageUpdated.durable?.supersedes).toBe("info.id")
+      expect(SessionV1.Event.PartUpdated.durable?.supersedes).toBe("part.id")
+      expect(EventV2.entityIdentity({ info: { id: "msg_1" } }, "info.id")).toBe("msg_1")
+      expect(EventV2.entityIdentity({ info: { id: 1 } }, "info.id")).toBeUndefined()
+      expect(EventV2.entityIdentity({ info: null }, "info.id")).toBeUndefined()
     }),
   )
 
