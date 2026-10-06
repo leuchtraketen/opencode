@@ -6,6 +6,7 @@ import type { Data, Definition, Payload } from "@opencode-ai/schema/event"
 import { and, asc, eq, gt, inArray, lt } from "drizzle-orm"
 import { Database } from "./database/database"
 import { EventSequenceTable, EventTable } from "./event/sql"
+import { ForeignTail } from "./event/foreign-tail"
 import { Location } from "./location"
 import { makeGlobalNode } from "./effect/app-node"
 import { isDeepStrictEqual } from "node:util"
@@ -191,6 +192,9 @@ export const layerWith = (options?: LayerOptions) =>
       const projectors = new Map<string, Subscriber[]>()
       // TODO: Bind durable projectors to exact type+version before supporting incompatible historical payloads.
       const listeners = new Array<Subscriber>()
+      // Highest sequence this process committed per aggregate. The foreign event tail reads it so rows this
+      // process wrote itself are never rebroadcast; see `./event/foreign-tail`.
+      const localSequence = new Map<string, number>()
       const { db } = yield* Database.Service
 
       const getOrCreate = (definition: Definition) =>
@@ -213,6 +217,11 @@ export const layerWith = (options?: LayerOptions) =>
           yield* Effect.forEach(pubsub.typed.values(), PubSub.shutdown, { discard: true })
         }),
       )
+
+      const wakeDurable = (aggregateID: string) =>
+        Effect.forEach(pubsub.durable.get(aggregateID) ?? [], (wake) => PubSub.publish(wake, undefined), {
+          discard: true,
+        })
 
       function commitDurableEvent(
         definition: Definition,
@@ -368,6 +377,9 @@ export const layerWith = (options?: LayerOptions) =>
                             ])
                             .run()
                             .pipe(Effect.orDie)
+                          // Recorded while the transaction still holds the connection, so the foreign event
+                          // tail cannot observe the new sequence before it is known to be ours.
+                          localSequence.set(aggregateID, seq)
                           // Snapshot collapse: the event just written fully describes its entity, so older
                           // snapshots of the same entity are redundant and are dropped from the log. Only
                           // locally authored events collapse; a replayed aggregate must mirror its source
@@ -393,13 +405,7 @@ export const layerWith = (options?: LayerOptions) =>
                       { behavior: "immediate" },
                     )
                     .pipe(Effect.orDie)
-                  if (committed) {
-                    yield* Effect.forEach(
-                      pubsub.durable.get(committed.aggregateID) ?? [],
-                      (wake) => PubSub.publish(wake, undefined),
-                      { discard: true },
-                    )
-                  }
+                  if (committed) yield* wakeDurable(committed.aggregateID)
                   return committed
                 }),
               )
@@ -455,6 +461,37 @@ export const layerWith = (options?: LayerOptions) =>
           const typed = pubsub.typed.get(event.type)
           if (typed) yield* PubSub.publish(typed, event)
           yield* PubSub.publish(pubsub.all, event)
+        })
+      }
+
+      /**
+       * Delivers event rows another process committed to the shared log as if they had been published here:
+       * durable stream wake plus the live notification path, but no projector and no write. Rows whose
+       * versioned type this build does not know are skipped.
+       */
+      function rebroadcast(rows: SerializedEvent[]) {
+        return Effect.gen(function* () {
+          for (const row of rows) {
+            if (!Durable.get(row.type)?.durable) {
+              yield* Effect.logDebug("Skipping foreign event with unknown durable type", {
+                eventID: row.id,
+                eventType: row.type,
+              })
+              continue
+            }
+            const event = yield* Effect.try({ try: () => decodeSerializedEvent(row), catch: (cause) => cause }).pipe(
+              Effect.catch((cause) =>
+                Effect.logWarning("Skipping foreign event that failed to decode", {
+                  eventID: row.id,
+                  eventType: row.type,
+                  cause,
+                }).pipe(Effect.as(undefined)),
+              ),
+            )
+            if (!event) continue
+            yield* wakeDurable(row.aggregateID)
+            yield* notify(event, true)
+          }
         })
       }
 
@@ -559,6 +596,7 @@ export const layerWith = (options?: LayerOptions) =>
             Effect.gen(function* () {
               yield* db.delete(EventSequenceTable).where(eq(EventSequenceTable.aggregate_id, aggregateID)).run()
               yield* db.delete(EventTable).where(eq(EventTable.aggregate_id, aggregateID)).run()
+              localSequence.delete(aggregateID)
             }),
           )
           .pipe(Effect.orDie)
@@ -660,6 +698,10 @@ export const layerWith = (options?: LayerOptions) =>
           list.push((event) => projector(event as Payload<D>))
           projectors.set(definition.type, list)
         })
+
+      // The layer is memoized once per process (shared memo map), so the tail runs once per process and
+      // stops with the layer scope.
+      yield* ForeignTail.start({ db, localSeq: (aggregateID) => localSequence.get(aggregateID), rebroadcast })
 
       return Service.of({
         publish,
