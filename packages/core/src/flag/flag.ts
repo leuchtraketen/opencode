@@ -60,6 +60,10 @@ export const Flag = {
   get OPENCODE_TUI_CONFIG() {
     return process.env["OPENCODE_TUI_CONFIG"]
   },
+  /** Poll interval of the foreign event tail in ms (see `event/foreign-tail.ts`); `0` disables it. */
+  get OPENCODE_FOREIGN_EVENT_TAIL_MS() {
+    return process.env["OPENCODE_FOREIGN_EVENT_TAIL_MS"]
+  },
   get OPENCODE_CONFIG_DIR() {
     return process.env["OPENCODE_CONFIG_DIR"]
   },

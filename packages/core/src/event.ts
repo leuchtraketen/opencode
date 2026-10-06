@@ -377,9 +377,6 @@ export const layerWith = (options?: LayerOptions) =>
                             ])
                             .run()
                             .pipe(Effect.orDie)
-                          // Recorded while the transaction still holds the connection, so the foreign event
-                          // tail cannot observe the new sequence before it is known to be ours.
-                          localSequence.set(aggregateID, seq)
                           // Snapshot collapse: the event just written fully describes its entity, so older
                           // snapshots of the same entity are redundant and are dropped from the log. Only
                           // locally authored events collapse; a replayed aggregate must mirror its source
@@ -405,7 +402,14 @@ export const layerWith = (options?: LayerOptions) =>
                       { behavior: "immediate" },
                     )
                     .pipe(Effect.orDie)
-                  if (committed) yield* wakeDurable(committed.aggregateID)
+                  if (committed) {
+                    // Recorded only once the transaction succeeded: a rolled-back write must not raise the
+                    // watermark, or a later foreign event at that sequence would be swallowed. The window
+                    // between commit and this line can at worst rebroadcast an own event once (consumers
+                    // reconcile by id), never hide a foreign one.
+                    localSequence.set(committed.aggregateID, committed.seq)
+                    yield* wakeDurable(committed.aggregateID)
+                  }
                   return committed
                 }),
               )
@@ -701,7 +705,16 @@ export const layerWith = (options?: LayerOptions) =>
 
       // The layer is memoized once per process (shared memo map), so the tail runs once per process and
       // stops with the layer scope.
-      yield* ForeignTail.start({ db, localSeq: (aggregateID) => localSequence.get(aggregateID), rebroadcast })
+      yield* ForeignTail.start({
+        db,
+        localSeq: (aggregateID) => localSequence.get(aggregateID),
+        pruneLocal: (present) => {
+          for (const aggregateID of localSequence.keys()) {
+            if (!present.has(aggregateID)) localSequence.delete(aggregateID)
+          }
+        },
+        rebroadcast,
+      })
 
       return Service.of({
         publish,

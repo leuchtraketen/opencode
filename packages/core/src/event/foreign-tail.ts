@@ -4,6 +4,7 @@ import { Cause, Duration, Effect, Schedule } from "effect"
 import { and, asc, eq, gt } from "drizzle-orm"
 import type { Database } from "../database/database"
 import type { SerializedEvent } from "../event"
+import { Flag } from "../flag/flag"
 import { EventSequenceTable, EventTable } from "./sql"
 
 /** Poll interval in milliseconds; unset uses the default, `0` or anything that is not a positive number disables the tail. */
@@ -22,6 +23,8 @@ export interface Target {
   readonly db: Database.Interface["db"]
   /** Highest sequence this process committed for the aggregate, if any. */
   readonly localSeq: (aggregateID: string) => number | undefined
+  /** Forget the local watermarks of aggregates no longer in `event_sequence` (removed by another process), so a recreated one is seen from seq 0. */
+  readonly pruneLocal: (present: ReadonlySet<string>) => void
   readonly rebroadcast: (rows: SerializedEvent[]) => Effect.Effect<void>
 }
 
@@ -33,7 +36,7 @@ export interface Target {
  * excluded through `localSeq`.
  */
 export const start = Effect.fn("EventV2.ForeignTail.start")(function* (target: Target) {
-  const ms = interval(process.env[EnvVar])
+  const ms = interval(Flag.OPENCODE_FOREIGN_EVENT_TAIL_MS)
   if (ms === undefined) return
   const remembered = yield* sequences(target.db).pipe(Effect.orDie)
   let version = yield* dataVersion(target.db).pipe(Effect.orDie)
@@ -43,9 +46,14 @@ export const start = Effect.fn("EventV2.ForeignTail.start")(function* (target: T
     if (current === version) return
     version = current
     const latest = yield* sequences(target.db)
+    // Gone from `event_sequence`: another process removed the aggregate. Forget both watermarks — the tail's and
+    // the process's own (an aggregate this process wrote never entered `remembered`, own commits do not change
+    // the data version) — otherwise a session recreated under the same id would be ignored until it passed the
+    // old high-water mark.
     for (const aggregateID of remembered.keys()) {
       if (!latest.has(aggregateID)) remembered.delete(aggregateID)
     }
+    target.pruneLocal(new Set(latest.keys()))
     for (const [aggregateID, seq] of latest) {
       const after = Math.max(remembered.get(aggregateID) ?? -1, target.localSeq(aggregateID) ?? -1)
       if (seq > after) {
@@ -64,6 +72,10 @@ export const start = Effect.fn("EventV2.ForeignTail.start")(function* (target: T
             data: row.data,
           })),
         )
+        // The sequence scan and the row read are separate snapshots: a commit between them is already in
+        // `rows`, so the position is what was actually delivered, never a value behind it.
+        remembered.set(aggregateID, Math.max(seq, rows.at(-1)?.seq ?? seq))
+        continue
       }
       remembered.set(aggregateID, seq)
     }

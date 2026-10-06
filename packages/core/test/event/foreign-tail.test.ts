@@ -203,4 +203,52 @@ describe("EventV2 foreign event tail", () => {
       expect(received).toHaveLength(2)
     }),
   )
+
+  it.live("sees an aggregate another process removed and recreated under the same id from seq 0 again", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const sessionID = Session.ID.create()
+      const received = new Array<EventV2.Payload>()
+      const recreated = yield* Deferred.make<void>()
+      yield* events.all().pipe(
+        Stream.runForEach((event) =>
+          Effect.sync(() => {
+            if (event.durable?.aggregateID !== sessionID) return
+            received.push(event)
+            if (received.length === 3) Deferred.doneUnsafe(recreated, Effect.void)
+          }),
+        ),
+        Effect.forkScoped,
+      )
+      yield* Effect.yieldNow
+
+      // This process writes seq 0 and 1 itself: its local watermark for the aggregate is 1.
+      yield* events.publish(SessionV1.Event.MessageUpdated, messageUpdated(sessionID, SessionV1.MessageID.ascending()))
+      yield* events.publish(SessionV1.Event.MessageUpdated, messageUpdated(sessionID, SessionV1.MessageID.ascending()))
+
+      // Another process deletes the aggregate ...
+      const foreign = new SqliteDatabase(filename)
+      foreign.run("PRAGMA busy_timeout = 5000")
+      foreign.run("delete from event where aggregate_id = ?", [sessionID])
+      foreign.run("delete from event_sequence where aggregate_id = ?", [sessionID])
+      foreign.close()
+      yield* Effect.sleep("200 millis")
+
+      // ... and recreates it: seq 0 again, at or below the old local watermark.
+      const messageID = SessionV1.MessageID.ascending()
+      commitForeign([
+        {
+          aggregateID: sessionID,
+          seq: 0,
+          type: EventV2.versionedType(SessionV1.Event.MessageUpdated.type, 1),
+          data: messageUpdated(sessionID, messageID),
+          entityID: messageID,
+        },
+      ])
+      yield* Deferred.await(recreated).pipe(Effect.timeout("1 second"))
+
+      expect(received.map((event) => event.durable?.seq)).toEqual([0, 1, 0])
+      expect(received[2]?.data).toEqual(messageUpdated(sessionID, messageID))
+    }),
+  )
 })
