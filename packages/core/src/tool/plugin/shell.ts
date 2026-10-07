@@ -61,6 +61,7 @@ export const Input = Schema.Struct({
 
 const StructuredOutput = Schema.Struct({
   exit: Schema.optionalKey(Schema.Number),
+  signal: Schema.optionalKey(Schema.String),
   shellID: Schema.optionalKey(Schema.String),
   truncated: Schema.Boolean,
   timeout: Schema.optionalKey(Schema.Boolean),
@@ -121,7 +122,9 @@ export const Plugin = {
       const target = yield* access.resolve({ path: invocation.cwd, kind: "directory" })
       invocation.cwd = target.absolute
       const timeout = invocation.timeout
-      const portable = Config.latest(yield* config.entries(), "experimental")?.portable_shell_scanner === true
+      const portable =
+        Config.latest(yield* config.entries(), "experimental")?.portable_shell_scanner ??
+        (ctx.app.channel === "local" || ctx.app.channel === "dev")
       const parsed = yield* ShellParse.scan(invocation.command, invocation.shell, target.absolute, { portable })
       const directories = yield* Effect.forEach(parsed.directories, (directory) =>
         access.resolve({
@@ -206,6 +209,10 @@ export const Plugin = {
                 },
                 (invocation) =>
                   Effect.gen(function* () {
+                    invocation.env.AGENT = "1"
+                    invocation.env.OPENCODE = "1"
+                    invocation.env.AI_AGENT ||= "opencode"
+                    invocation.env.OPENCODE_SESSION_ID = context.sessionID
                     finalTimeout = yield* prepare(invocation, context)
                   }),
               )

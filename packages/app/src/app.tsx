@@ -4,34 +4,22 @@ import { FileComponentProvider } from "@opencode/ui/context/file"
 import { Font } from "@opencode/ui/font"
 import { ThemeProvider } from "@opencode/ui/theme/context"
 import { MetaProvider } from "@solidjs/meta"
-import { type BaseRouterProps, Router, useLocation } from "@solidjs/router"
+import { type BaseRouterProps, Router } from "@solidjs/router"
 import { QueryClient, QueryClientProvider } from "@tanstack/solid-query"
-import { type Component, createRenderEffect, ErrorBoundary, type JSX, type ParentProps, Show } from "solid-js"
+import { type Component, createRenderEffect, ErrorBoundary, type JSX, type ParentProps } from "solid-js"
 import { Dynamic } from "solid-js/web"
 import { CommandProvider } from "@/shell/commands/command"
 import { DesktopCommands } from "@/shell/commands/desktop"
 import { GlobalProvider } from "@/runtime/server/runtime"
-import { HighlightsProvider } from "@/shell/updates/highlights"
 import { LanguageProvider, UiI18nBridge, type Locale } from "@/runtime/i18n/language"
 import { ServerConnection, ServersProvider } from "@/runtime/server/registry"
 import { SettingsProvider } from "@/settings/model"
 import { TabsProvider } from "@/shell/tabs/tabs"
-import { WslServersProvider } from "@/servers/wsl/context"
-import { SshProvider } from "@/servers/ssh/context"
-import { SshRestore } from "@/servers/ssh/restore"
 import { ErrorPage } from "@/shell/errors/error"
 import { AppRoutes, File, preloadRoute } from "@/shell/routes/routes"
+import { ExtensionRoot } from "@/runtime/extension/root"
 
 export { preloadRoute }
-
-declare global {
-  interface Window {
-    api?: {
-      setTitlebar?: (theme: { mode: "light" | "dark"; scheme?: "system" | "light" | "dark" }) => Promise<void>
-      exportDebugLogs?: () => Promise<string>
-    }
-  }
-}
 
 function QueryProvider(props: ParentProps) {
   const client = new QueryClient({
@@ -43,6 +31,7 @@ function QueryProvider(props: ParentProps) {
       },
     },
   })
+
   return <QueryClientProvider client={client}>{props.children}</QueryClientProvider>
 }
 
@@ -68,7 +57,6 @@ export function AppBaseProviders(
       <Font />
       <ThemeProvider
         onThemeApplied={(_, mode, scheme) => {
-          void window.api?.setTitlebar?.({ mode, scheme })
           props.onThemeApplied?.(mode, scheme)
         }}
       >
@@ -77,17 +65,16 @@ export function AppBaseProviders(
             <ErrorBoundary
               fallback={(error) => {
                 void import("@sentry/solid").then(({ captureException }) => captureException(error))
+
                 return <ErrorPage error={error} />
               }}
             >
               <QueryProvider>
-                <WslServersProvider>
-                  <DialogProvider>
-                    <SshProvider>
-                      <FileComponentProvider component={File}>{props.children}</FileComponentProvider>
-                    </SshProvider>
-                  </DialogProvider>
-                </WslServersProvider>
+                <DialogProvider>
+                  <ExtensionRoot>
+                    <FileComponentProvider component={File}>{props.children}</FileComponentProvider>
+                  </ExtensionRoot>
+                </DialogProvider>
               </QueryProvider>
             </ErrorBoundary>
           </UiI18nBridge>
@@ -99,7 +86,6 @@ export function AppBaseProviders(
 
 export function AppInterface(props: {
   children?: JSX.Element
-  defaultServer?: ServerConnection.Key
   canonicalLocalServer?: ServerConnection.Key
   servers?: Array<ServerConnection.Any>
   router?: Component<BaseRouterProps>
@@ -107,36 +93,21 @@ export function AppInterface(props: {
   // The visual layout lives in the router root so it remains mounted across
   // route changes. Draft and session routes override only their server-bound data
   // providers beneath it.
-  const Root = (rootProps: ParentProps) => {
-    const location = useLocation()
-    // Pairing saves credentials before mounting any server connections or health checks.
-    return (
-      <>
+  const Root = (rootProps: ParentProps) => (
+    <TabsProvider>
+      <GlobalProvider>
         <BodyTypography />
-        <Show when={location.pathname !== "/connect"} fallback={rootProps.children}>
-          <TabsProvider>
-            <GlobalProvider>
-              <CommandProvider>
-                <DesktopCommands />
-                <SshRestore />
-                <HighlightsProvider>
-                  {props.children}
-                  {rootProps.children}
-                </HighlightsProvider>
-              </CommandProvider>
-            </GlobalProvider>
-          </TabsProvider>
-        </Show>
-      </>
-    )
-  }
+        <CommandProvider>
+          <DesktopCommands />
+          {props.children}
+          {rootProps.children}
+        </CommandProvider>
+      </GlobalProvider>
+    </TabsProvider>
+  )
 
   return (
-    <ServersProvider
-      defaultServer={props.defaultServer}
-      canonicalLocalServer={props.canonicalLocalServer}
-      servers={props.servers}
-    >
+    <ServersProvider canonicalLocalServer={props.canonicalLocalServer} servers={props.servers}>
       <SettingsProvider>
         <Dynamic component={props.router ?? Router} root={Root}>
           <AppRoutes />
