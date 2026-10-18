@@ -205,6 +205,49 @@ describe("step-finish token propagation via event", () => {
   )
 })
 
+describe("session usage", () => {
+  it.instance("does not bill a session for usage inherited from before it existed", () =>
+    Effect.gen(function* () {
+      const session = yield* SessionNs.Service
+      const info = yield* Effect.acquireRelease(session.create({}), (created) =>
+        session.remove(created.id).pipe(Effect.ignore),
+      )
+      const step = (created: number, cost: number) =>
+        Effect.gen(function* () {
+          const messageID = MessageID.ascending()
+          yield* session.updateMessage({
+            id: messageID,
+            sessionID: info.id,
+            role: "user",
+            time: { created },
+            agent: "user",
+            model: { providerID: "test", modelID: "test" },
+          } as SessionV1.User)
+          const partID = PartID.ascending()
+          yield* session.updatePart({
+            id: partID,
+            messageID,
+            sessionID: info.id,
+            type: "step-finish",
+            reason: "stop",
+            cost,
+            tokens: { total: 10, input: 10, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+          })
+          return { messageID, partID }
+        })
+
+      const inherited = yield* step(info.time.created - 1, 5)
+      yield* step(info.time.created, 2)
+      expect((yield* session.get(info.id)).cost).toBe(2)
+
+      yield* session.removePart({ sessionID: info.id, ...inherited })
+      const saved = yield* session.get(info.id)
+      expect(saved.cost).toBe(2)
+      expect(saved.tokens?.input).toBe(10)
+    }),
+  )
+})
+
 describe("Session", () => {
   it.live("remove works without an instance", () =>
     Effect.gen(function* () {

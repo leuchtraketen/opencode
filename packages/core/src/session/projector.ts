@@ -16,6 +16,7 @@ import { MessageTable, PartTable, SessionInputTable, SessionMessageTable, Sessio
 import type { DeepMutable } from "../schema"
 
 type DatabaseService = Database.Interface["db"]
+type MessageRow = typeof MessageTable.$inferSelect
 
 const decodeMessage = Schema.decodeUnknownSync(SessionMessage.Message)
 const encodeMessage = Schema.encodeSync(SessionMessage.Message)
@@ -106,6 +107,35 @@ function applyUsage(
     .where(eq(SessionTable.id, sessionID))
     .run()
     .pipe(Effect.orDie)
+}
+
+// Session.fork copies the parent's messages with their original time.created, so a message older
+// than its session is inherited history: the parent already carries that usage, and counting it
+// again would bill one model call once per fork.
+function inherited(db: DatabaseService, sessionID: MessageRow["session_id"], messageID: MessageRow["id"]) {
+  return db
+    .select({ message: MessageTable.time_created, session: SessionTable.time_created })
+    .from(MessageTable)
+    .innerJoin(SessionTable, eq(SessionTable.id, MessageTable.session_id))
+    .where(and(eq(MessageTable.id, messageID), eq(MessageTable.session_id, sessionID)))
+    .get()
+    .pipe(
+      Effect.orDie,
+      Effect.map((row) => row !== undefined && row.message < row.session),
+    )
+}
+
+function applyOwnUsage(
+  db: DatabaseService,
+  sessionID: MessageRow["session_id"],
+  messageID: MessageRow["id"],
+  value: Usage,
+  sign = 1,
+) {
+  return Effect.gen(function* () {
+    if (yield* inherited(db, sessionID, messageID)) return
+    yield* applyUsage(db, sessionID, value, sign)
+  })
 }
 
 function run(db: DatabaseService, event: SessionEvent.Event) {
@@ -281,7 +311,7 @@ const layer = Layer.effectDiscard(
           .pipe(Effect.orDie)
         for (const row of rows) {
           const previous = usage(row.data)
-          if (previous) yield* applyUsage(db, event.data.sessionID, previous, -1)
+          if (previous) yield* applyOwnUsage(db, event.data.sessionID, event.data.messageID, previous, -1)
         }
         yield* db
           .delete(MessageTable)
@@ -299,7 +329,7 @@ const layer = Layer.effectDiscard(
           .get()
           .pipe(Effect.orDie)
         const previous = row && usage(row.data)
-        if (previous) yield* applyUsage(db, event.data.sessionID, previous, -1)
+        if (previous) yield* applyOwnUsage(db, event.data.sessionID, row.message_id, previous, -1)
         yield* db
           .delete(PartTable)
           .where(and(eq(PartTable.id, event.data.partID), eq(PartTable.session_id, event.data.sessionID)))
@@ -322,8 +352,8 @@ const layer = Layer.effectDiscard(
           .pipe(Effect.orDie)
         const previous = row && usage(row.data)
         const next = usage(event.data.part)
-        if (previous) yield* applyUsage(db, row.session_id, previous, -1)
-        if (next) yield* applyUsage(db, sessionID, next)
+        if (previous) yield* applyOwnUsage(db, row.session_id, row.message_id, previous, -1)
+        if (next) yield* applyOwnUsage(db, sessionID, messageID, next)
       }),
     )
     yield* events.project(SessionEvent.AgentSwitched, (event) =>

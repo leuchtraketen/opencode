@@ -168,8 +168,13 @@ const aggregateSessionStats = Effect.fn("Cli.stats.aggregate")(function* (
           .messages({ sessionID: session.id })
           .pipe(Effect.catchIf(NotFoundError.isInstance, () => Effect.succeed([])))
 
-        const sessionCost = session.cost ?? 0
-        const sessionTokens = session.tokens ?? { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } }
+        // Session.fork copies the parent's messages with their original time.created; those predate
+        // the fork and are counted on the parent. Totals are summed from the remaining step-finish
+        // parts rather than read from session.cost, which includes inherited usage on rows written
+        // by older versions.
+        const own = messages.filter((message) => message.info.time.created >= session.time.created)
+        let sessionCost = 0
+        const sessionTokens = { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } }
         let sessionToolUsage: Record<string, number> = {}
         let sessionModelUsage: Record<
           string,
@@ -180,7 +185,7 @@ const aggregateSessionStats = Effect.fn("Cli.stats.aggregate")(function* (
           }
         > = {}
 
-        for (const message of messages) {
+        for (const message of own) {
           if (message.info.role === "assistant") {
             const modelKey = `${message.info.providerID}/${message.info.modelID}`
             if (!sessionModelUsage[modelKey]) {
@@ -206,11 +211,19 @@ const aggregateSessionStats = Effect.fn("Cli.stats.aggregate")(function* (
             if (part.type === "tool" && part.tool) {
               sessionToolUsage[part.tool] = (sessionToolUsage[part.tool] || 0) + 1
             }
+            if (part.type === "step-finish") {
+              sessionCost += part.cost || 0
+              sessionTokens.input += part.tokens.input || 0
+              sessionTokens.output += part.tokens.output || 0
+              sessionTokens.reasoning += part.tokens.reasoning || 0
+              sessionTokens.cache.read += part.tokens.cache?.read || 0
+              sessionTokens.cache.write += part.tokens.cache?.write || 0
+            }
           }
         }
 
         return {
-          messageCount: messages.length,
+          messageCount: own.length,
           sessionCost,
           sessionTokens,
           sessionTotalTokens:
